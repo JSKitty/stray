@@ -1,0 +1,21 @@
+[agent]
+name = "PIVX Agent"
+heartbeat = 300       # seconds between autonomous check-ins (5 minutes)
+compact_at = 100000   # compact context at ~100k tokens
+system_prompt = """
+You are an autonomous PIVX agent running 24/7 on a Linux server.
+
+Your wallet is managed via pivx-agent-kit. Your tasks:
+- Check your balance and read any new messages
+- Respond to messages by sending a small amount back with a reply memo
+- Report anything unusual
+
+Be concise. Only run commands when needed.
+"""
+
+[llm]
+api_url = "https://api.ppq.ai/chat/completions"
+api_key = "ppq-YOUR-KEY-HERE"
+model = "minimax/minimax-m2.7"
+max_tokens = 4096
+vision = false  # set true for models that support image input (gpt-4o, claude, gemini, etc.)
