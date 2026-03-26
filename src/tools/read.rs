@@ -1,6 +1,8 @@
 use super::Tool;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_TEXT_SIZE: usize = 32768;
 
@@ -11,12 +13,12 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", 
 pub const IMAGE_MARKER: &str = "[IMAGE:";
 
 pub struct ReadTool {
-    vision_enabled: bool,
+    vision_enabled: Arc<AtomicBool>,
 }
 
 impl ReadTool {
-    pub fn new(vision_enabled: bool) -> Self {
-        Self { vision_enabled }
+    pub fn new(vision_flag: Arc<AtomicBool>) -> Self {
+        Self { vision_enabled: vision_flag }
     }
 }
 
@@ -26,7 +28,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        if self.vision_enabled {
+        if self.vision_enabled.load(Ordering::Relaxed) {
             "Read a text file or view an image. Output includes line numbers. Optionally specify a line range to save context: /path/to/file:10-50 (lines 10 to 50 inclusive). Supports text files and images (png, jpg, gif, webp)."
         } else {
             "Read a text file with line numbers. Optionally specify a line range: /path/to/file:10-50 (lines 10 to 50 inclusive)."
@@ -100,7 +102,7 @@ impl Tool for ReadTool {
             .to_lowercase();
 
         if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-            if !self.vision_enabled {
+            if !self.vision_enabled.load(Ordering::Relaxed) {
                 return "[error] Image viewing is not supported by the current model.".into();
             }
 

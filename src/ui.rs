@@ -937,8 +937,9 @@ fn wrap_chat_line(line: &ChatLine, width: usize, md: &mut MarkdownRenderer, md_o
             };
 
             if let Some(fades) = fade {
-                let settled_count = fades.iter().position(|&f| f > 0).unwrap_or(fades.len());
                 let char_count = clean.chars().count();
+                // Cap settled_count to clean's length (fade_chars may be longer due to trimming/collapsing)
+                let settled_count = fades.iter().position(|&f| f > 0).unwrap_or(fades.len()).min(char_count);
 
                 if settled_count >= char_count {
                     let rendered = render_content_with_code(clean, md, md_out, is_streaming);
@@ -1008,24 +1009,37 @@ fn wrap_styled_with_prefix(first_prefix: &str, cont_prefix: &str, styled: &str, 
     let max = inner;
 
     // Track the last word boundary for potential wrap point
-    let mut last_space_row_len = 0usize; // byte position in current_row after the space
-    let mut last_space_vis = 0usize;     // vis_count after the space
+    let mut last_space_row_len = 0usize;
+    let mut last_space_vis = 0usize;
     let mut has_space = false;
+    let mut active_style = String::new(); // current ANSI state for carry-over across wraps
+    let mut escape_buf = String::new();
 
     for ch in styled.chars() {
         if in_escape {
             current_row.push(ch);
-            if ch.is_ascii_alphabetic() { in_escape = false; }
+            escape_buf.push(ch);
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+                // Track active style (reset clears it)
+                if escape_buf.contains("[0m") || escape_buf.contains("[0;") {
+                    active_style.clear();
+                } else {
+                    active_style = format!("\x1b{escape_buf}");
+                }
+                escape_buf.clear();
+            }
             continue;
         }
         if ch == '\x1b' {
             current_row.push(ch);
             in_escape = true;
+            escape_buf.clear();
             continue;
         }
         if ch == '\n' {
             rows.push(current_row);
-            current_row = String::new();
+            current_row = active_style.clone();
             vis_count = 0;
             has_space = false;
             continue;
@@ -1033,16 +1047,14 @@ fn wrap_styled_with_prefix(first_prefix: &str, cont_prefix: &str, styled: &str, 
         let cw = char_display_width(ch);
         if vis_count + cw > max {
             if has_space && last_space_vis > 0 {
-                // Break at the last word boundary
                 let overflow = current_row[last_space_row_len..].to_string();
                 current_row.truncate(last_space_row_len);
                 rows.push(current_row);
-                current_row = overflow;
-                vis_count = vis_count - last_space_vis;
+                current_row = format!("{active_style}{overflow}");
+                vis_count = vis_count.saturating_sub(last_space_vis); // #8 fix
             } else {
-                // No space found — character wrap (long word)
                 rows.push(current_row);
-                current_row = String::new();
+                current_row = active_style.clone();
                 vis_count = 0;
             }
             has_space = false;

@@ -2,19 +2,21 @@ use super::Tool;
 use std::fs;
 use std::path::Path;
 
+const DELIMITER: &str = "\n----------\n";
+
 pub struct EditTool;
 
 impl Tool for EditTool {
     fn name(&self) -> &str { "edit" }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing text. Format: first line is the file path, then ---, then the exact text to find, then ---, then the replacement text. The search text must be unique in the file (appear exactly once)."
+        "Edit a file by replacing text. Format: first line is the file path, then ---------- (10 dashes), then the exact text to find, then ----------, then the replacement text. The search text must be unique in the file (appear exactly once)."
     }
 
     fn tag(&self) -> &str { "edit" }
 
     fn usage_hint(&self) -> &str {
-        "/path/to/file\n---\ntext to find\n---\nreplacement text"
+        "/path/to/file\n----------\ntext to find\n----------\nreplacement text"
     }
 
     fn display_action(&self, input: &str) -> String {
@@ -23,34 +25,38 @@ impl Tool for EditTool {
     }
 
     fn execute(&self, input: &str) -> String {
-        // Parse: filepath\n---\nold\n---\nnew
-        let Some((path_str, rest)) = input.split_once("\n---\n") else {
-            return "[error] Invalid format. Expected: filepath\\n---\\nold_text\\n---\\nnew_text".into();
+        // Parse: filepath\n----------\nold\n----------\nnew
+        let Some((path_str, rest)) = input.split_once(DELIMITER) else {
+            return "[error] Invalid format. Expected: filepath\\n----------\\nold_text\\n----------\\nnew_text".into();
         };
         let path_str = path_str.trim();
 
-        let Some((old_text, new_text)) = rest.split_once("\n---\n").or_else(|| rest.split_once("\n---")) else {
-            return "[error] Invalid format. Missing second --- delimiter between old and new text.".into();
+        let Some((old_text, new_text)) = rest.split_once(DELIMITER)
+            .or_else(|| rest.split_once("\n----------"))
+        else {
+            return "[error] Invalid format. Missing second ---------- delimiter between old and new text.".into();
         };
 
-        // Block sensitive paths
+        // Resolve symlinks + normalize before checking blocklist
+        let raw_path = Path::new(path_str);
+        let resolved = raw_path.canonicalize().unwrap_or_else(|_| raw_path.to_path_buf());
+        let path_lower = resolved.to_string_lossy().to_lowercase();
+
         const BLOCKED_PATHS: &[&str] = &[
             "/seed", "/secret", "/mnemonic", "wallet.json", "secret.key",
             "/etc/shadow", ".ssh/", "id_rsa", "id_ed25519",
         ];
-        let path_lower = path_str.to_lowercase();
         for pattern in BLOCKED_PATHS {
             if path_lower.contains(pattern) {
                 return format!("[BLOCKED] Editing this path is restricted: {pattern}");
             }
         }
 
-        let path = Path::new(path_str);
-        if !path.exists() {
+        if !resolved.exists() {
             return format!("[error] File not found: {path_str}");
         }
 
-        let content = match fs::read_to_string(path) {
+        let content = match fs::read_to_string(&resolved) {
             Ok(c) => c,
             Err(e) => return format!("[error] Failed to read: {e}"),
         };
@@ -64,10 +70,9 @@ impl Tool for EditTool {
             return format!("[error] Search text found {count} times — must be unique. Add more surrounding context to disambiguate.");
         }
 
-        // Perform replacement
         let new_content = content.replacen(old_text, new_text, 1);
 
-        match fs::write(path, &new_content) {
+        match fs::write(&resolved, &new_content) {
             Ok(()) => {
                 let old_lines = old_text.lines().count();
                 let new_lines = new_text.lines().count();

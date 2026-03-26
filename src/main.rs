@@ -362,13 +362,13 @@ fn call_llm(
     }
 
     // Flush any leftover tag buffer (partial tag at end of stream)
+    // Note: content already has these chars from the streaming loop (line 256)
     if !tag_buf.is_empty() && !inside_tool_tag {
         if let Some(ref mut s) = state {
             if streaming_started {
                 s.append_streaming(&tag_buf);
             }
         }
-        content.push_str(&tag_buf);
     }
 
     // Stream ended without data: [DONE] — server disconnected or thread died
@@ -1089,11 +1089,12 @@ fn main() {
         ConfigSource::Wizard => "new",
     };
 
-    // Register tools
+    // Register tools (vision flag is shared so model switches update it)
+    let vision_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llm.vision));
     let registry = {
         let mut r = ToolRegistry::new();
         r.add(Box::new(tools::BashTool));
-        r.add(Box::new(tools::ReadTool::new(config.llm.vision)));
+        r.add(Box::new(tools::ReadTool::new(vision_flag.clone())));
         r.add(Box::new(tools::WriteTool));
         r.add(Box::new(tools::EditTool));
         r
@@ -1183,6 +1184,7 @@ fn main() {
                                         fmt_str = if tools_json.is_some() { "openai-api" } else { "prompt-xml" };
                                         if let Some(info) = get_model_info(&value) {
                                             config.llm.vision = info.vision;
+                                        vision_flag.store(info.vision, std::sync::atomic::Ordering::Relaxed);
                                             config.agent.compact_at = (info.context_length as f64 * 0.8) as usize;
                                         }
                                         if let Some(msg) = messages.first_mut() {
@@ -1448,7 +1450,9 @@ fn main() {
                     }
                     // Clear Ctrl+C hint when another key was pressed
                     if last_ctrlc == 0 && state.ctrlc_hint {
-                        state.chat.pop();
+                        if let Some(pos) = state.chat.iter().rposition(|l| matches!(l.kind, ChatLineKind::SystemInfo) && l.content == "Press Ctrl+C again to exit") {
+                            state.chat.remove(pos);
+                        }
                         state.ctrlc_hint = false;
                     }
                     state.render();
@@ -1628,6 +1632,7 @@ fn main() {
                                 fmt_str = if tools_json.is_some() { "openai-api" } else { "prompt-xml" };
                                 if let Some(info) = found {
                                     config.llm.vision = info.vision;
+                                        vision_flag.store(info.vision, std::sync::atomic::Ordering::Relaxed);
                                     config.agent.compact_at = (info.context_length as f64 * 0.8) as usize;
                                 }
                                 if let Some(msg) = messages.first_mut() {
