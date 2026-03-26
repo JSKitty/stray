@@ -155,11 +155,12 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 
 pub static AVAILABLE_MODELS: Mutex<Vec<ModelInfo>> = Mutex::new(Vec::new());
 
-pub fn update_model_cache(api_url: &str, api_key: &str) {
-    let models = config::fetch_models(api_url, api_key);
+pub fn update_model_cache(api_url: &str, api_key: &str) -> Result<(), String> {
+    let models = config::fetch_models(api_url, api_key)?;
     if let Ok(mut guard) = AVAILABLE_MODELS.lock() {
         *guard = models;
     }
+    Ok(())
 }
 
 pub fn get_model_info(key: &str) -> Option<ModelInfo> {

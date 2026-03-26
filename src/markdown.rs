@@ -7,6 +7,7 @@ use std::fmt::Write;
 pub struct MarkdownRenderer {
     bold: bool,
     italic: bool,
+    code: bool,
     pending_star: bool,
     pending_newlines: usize,
     last_printed: char,
@@ -15,7 +16,7 @@ pub struct MarkdownRenderer {
 
 impl MarkdownRenderer {
     pub fn new() -> Self {
-        Self { bold: false, italic: false, pending_star: false, pending_newlines: 0, last_printed: ' ', base_style: "" }
+        Self { bold: false, italic: false, code: false, pending_star: false, pending_newlines: 0, last_printed: ' ', base_style: "" }
     }
 
     pub fn with_base_style(style: &'static str) -> Self {
@@ -24,6 +25,7 @@ impl MarkdownRenderer {
 
     fn apply_style(&self, out: &mut String) {
         let _ = write!(out, "{RESET}{}", self.base_style);
+        if self.code { let _ = write!(out, "{YELLOW}"); }
         if self.bold { let _ = write!(out, "{BOLD}"); }
         if self.italic { let _ = write!(out, "{ITALIC}"); }
     }
@@ -55,6 +57,16 @@ impl MarkdownRenderer {
 
     pub fn feed(&mut self, text: &str, out: &mut String) {
         for ch in text.chars() {
+            // Inside inline code: only backtick is special
+            if self.code {
+                if ch == '`' {
+                    self.code = false;
+                    self.apply_style(out);
+                } else {
+                    self.print_char(ch, out);
+                }
+                continue;
+            }
             if self.pending_star {
                 self.pending_star = false;
                 if ch == '*' {
@@ -70,6 +82,9 @@ impl MarkdownRenderer {
                 }
             } else if ch == '*' {
                 self.pending_star = true;
+            } else if ch == '`' {
+                self.code = true;
+                self.apply_style(out);
             } else {
                 self.print_char(ch, out);
             }
@@ -89,6 +104,7 @@ impl MarkdownRenderer {
                 out.push('*');
             }
         }
+        self.code = false;
         self.pending_newlines = 0;
         let _ = write!(out, "{RESET}");
     }

@@ -686,6 +686,7 @@ fn build_system_prompt(config: &Config, format: &dyn ModelFormat, registry: &Too
 /// Config fields: (key, label, description). Adding a new setting = adding one line here.
 const CONFIG_FIELDS: &[(&str, &str, &str)] = &[
     ("provider", "Provider", "The LLM API provider to connect to"),
+    ("api_key", "API Key", "Authentication key for the LLM provider"),
     ("name", "Agent Name", "Your companion's name, shown in the header and system prompt"),
     ("heartbeat", "Heartbeat", "Seconds between autonomous check-ins (0 to disable)"),
     ("system_prompt", "System Prompt", "Instructions that define the agent's personality and behavior"),
@@ -710,6 +711,11 @@ fn detect_provider(api_url: &str) -> String {
 fn get_config_value(config: &Config, key: &str) -> String {
     match key {
         "provider" => detect_provider(&config.llm.api_url),
+        "api_key" => {
+            let k = &config.llm.api_key;
+            if k.len() <= 8 { k.clone() }
+            else { format!("{}...{}", &k[..4], &k[k.len()-4..]) } // mask middle
+        }
         "name" => config.agent.name.clone(),
         "heartbeat" => format!("{}s", config.agent.heartbeat),
         "system_prompt" => {
@@ -799,6 +805,13 @@ fn save_config_field(scope: &str, field: &str, value: &str) -> Result<std::path:
                 .or_insert(toml::Value::Table(toml::map::Map::new()));
             if let Some(t) = sec.as_table_mut() {
                 t.insert("heartbeat".into(), toml::Value::Integer(secs as i64));
+            }
+        }
+        "api_key" => {
+            let llm = table.entry("llm")
+                .or_insert(toml::Value::Table(toml::map::Map::new()));
+            if let Some(t) = llm.as_table_mut() {
+                t.insert("api_key".into(), toml::Value::String(value.into()));
             }
         }
         "name" | "system_prompt" => {
@@ -944,6 +957,66 @@ fn format_context_display(messages: &[Message], config: &Config) -> String {
     out
 }
 
+/// Switch provider with per-provider settings save/restore.
+/// Saves current LLM settings under [providers.old_name], loads [providers.new_name] if it exists.
+fn switch_provider(config: &mut Config, new_provider: &str, config_path: &std::path::Path) -> Result<bool, String> {
+    let old_provider = detect_provider(&config.llm.api_url).to_lowercase();
+    let path = config_path;
+
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: toml::Value = content.parse()
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let table = doc.as_table_mut().ok_or("Invalid TOML")?;
+
+    // Save current settings under [providers.old_name]
+    let providers = table.entry("providers")
+        .or_insert(toml::Value::Table(toml::map::Map::new()));
+    if let Some(p) = providers.as_table_mut() {
+        let mut saved = toml::map::Map::new();
+        saved.insert("api_url".into(), toml::Value::String(config.llm.api_url.clone()));
+        saved.insert("api_key".into(), toml::Value::String(config.llm.api_key.clone()));
+        saved.insert("model".into(), toml::Value::String(config.llm.model.clone()));
+        p.insert(old_provider, toml::Value::Table(saved));
+    }
+
+    // Check if [providers.new_name] exists with saved settings
+    let restored = if let Some(saved) = table.get("providers")
+        .and_then(|p| p.get(new_provider))
+        .and_then(|s| s.as_table())
+    {
+        if let Some(url) = saved.get("api_url").and_then(|v| v.as_str()) {
+            config.llm.api_url = url.to_string();
+        }
+        if let Some(key) = saved.get("api_key").and_then(|v| v.as_str()) {
+            config.llm.api_key = key.to_string();
+        }
+        if let Some(model) = saved.get("model").and_then(|v| v.as_str()) {
+            config.llm.model = model.to_string();
+        }
+        true
+    } else {
+        // No saved settings — use provider defaults
+        if let Some((_, url, key)) = PROVIDERS.iter().find(|(n, _, _)| n.to_lowercase() == new_provider) {
+            config.llm.api_url = url.to_string();
+            if !key.is_empty() { config.llm.api_key = key.to_string(); }
+        }
+        false
+    };
+
+    // Write [llm] with new values
+    let llm = table.entry("llm")
+        .or_insert(toml::Value::Table(toml::map::Map::new()));
+    if let Some(t) = llm.as_table_mut() {
+        t.insert("api_url".into(), toml::Value::String(config.llm.api_url.clone()));
+        t.insert("api_key".into(), toml::Value::String(config.llm.api_key.clone()));
+        t.insert("model".into(), toml::Value::String(config.llm.model.clone()));
+    }
+
+    let output = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(path, output).map_err(|e| e.to_string())?;
+    Ok(restored)
+}
+
 fn apply_config_change(config: &mut Config, field: &str, value: &str) {
     match field {
         "provider" => {
@@ -952,6 +1025,7 @@ fn apply_config_change(config: &mut Config, field: &str, value: &str) {
                 if !key.is_empty() { config.llm.api_key = key.to_string(); }
             }
         }
+        "api_key" => config.llm.api_key = value.to_string(),
         "name" => config.agent.name = value.to_string(),
         "heartbeat" => {
             if let Ok(secs) = value.trim().trim_end_matches('s').parse::<u64>() {
@@ -1001,8 +1075,12 @@ fn main() {
     let tools_str = registry.tools().iter().map(|t| t.name()).collect::<Vec<_>>().join(", ");
     let mut fmt_str = if tools_json.is_some() { "openai-api" } else { "prompt-xml" };
 
-    // Fetch models for autocomplete
-    update_model_cache(&config.llm.api_url, &config.llm.api_key);
+    // Fetch models in background (non-blocking startup)
+    {
+        let url = config.llm.api_url.clone();
+        let key = config.llm.api_key.clone();
+        std::thread::spawn(move || { let _ = update_model_cache(&url, &key); });
+    }
 
     // Enter raw mode + alternate screen
     enable_raw_mode();
@@ -1107,6 +1185,7 @@ fn main() {
                                                         .unwrap_or((field, ""));
                                                     let full_value = match field {
                                                         "name" => config.agent.name.clone(),
+                                                        "api_key" => config.llm.api_key.clone(),
                                                         "heartbeat" => config.agent.heartbeat.to_string(),
                                                         "system_prompt" => config.agent.system_prompt.clone(),
                                                         _ => get_config_value(&config, field),
@@ -1121,21 +1200,41 @@ fn main() {
                                         }
                                         ["config", scope, "provider"] => {
                                             let scope = scope.to_string();
-                                            match save_config_field(&scope, "provider", &value) {
-                                                Ok(_) => {
-                                                    apply_config_change(&mut config, "provider", &value);
-                                                    let name = PROVIDERS.iter().find(|(n, _, _)| n.to_lowercase() == value).map(|p| p.0).unwrap_or(&value);
-                                                    state.push_chat(ChatLine {
-                                                        kind: ChatLineKind::SystemInfo,
-                                                        content: format!("Provider set to {BOLD}{name}{RESET}"),
-                                                    });
+                                            match switch_provider(&mut config, &value, &config_path) {
+                                                Ok(restored) => {
+                                                    let prov = PROVIDERS.iter().find(|(n, _, _)| n.to_lowercase() == value);
+                                                    let name = prov.map(|p| p.0).unwrap_or(&value);
+                                                    let needs_key = prov.map(|p| p.2.is_empty()).unwrap_or(false);
+                                                    let msg = if restored {
+                                                        format!("Switched to {BOLD}{name}{RESET} {DIM}(settings restored){RESET}")
+                                                    } else {
+                                                        format!("Switched to {BOLD}{name}{RESET}")
+                                                    };
+                                                    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: msg });
+                                                    // Update format + header for new model
+                                                    format = formats::format_for_model(&config.llm.model, &registry);
+                                                    tools_json = format.format_tools(&registry);
+                                                    fmt_str = if tools_json.is_some() { "openai-api" } else { "prompt-xml" };
+                                                    if let Some(msg) = messages.first_mut() {
+                                                        msg.content = build_system_prompt(&config, &*format, &registry, &cwd);
+                                                    }
                                                     state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
+                                                    if needs_key && !restored {
+                                                        // New provider with no saved key — open key editor
+                                                        state.config_edit = Some((scope.clone(), "api_key".to_string()));
+                                                        state.input.clear();
+                                                        state.input.insert_str(&config.llm.api_key);
+                                                        state.input_label = "API Key (ESC to cancel)".into();
+                                                        state.input_hint = "This provider requires an API key".into();
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Failed: {e}") });
                                                 }
                                             }
-                                            open_config_selector(&mut state, &format!("config:{scope}"), &config);
+                                            if state.config_edit.is_none() {
+                                                open_config_selector(&mut state, &format!("config:{scope}"), &config);
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -1369,7 +1468,7 @@ fn main() {
                 state.input_label.clear(); state.input_hint.clear();
                 // Sanitize single-line fields
                 let value = match field.as_str() {
-                    "name" => text.replace('\n', " ").trim().to_string(),
+                    "name" | "api_key" => text.replace('\n', "").trim().to_string(),
                     "heartbeat" => text.trim().trim_end_matches('s').trim().to_string(),
                     _ => text.clone(),
                 };
@@ -1420,8 +1519,46 @@ fn main() {
                     }
                     "/model" => {
                         if args.is_empty() {
-                            update_model_cache(&config.llm.api_url, &config.llm.api_key);
-                            let models = AVAILABLE_MODELS.lock().map(|m| m.clone()).unwrap_or_default();
+                            // Fetch models in background with spinner
+                            state.start_spinner("fetching models...");
+                            state.render();
+                            let fetch_url = config.llm.api_url.clone();
+                            let fetch_key = config.llm.api_key.clone();
+                            let (model_tx, model_rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let _ = model_tx.send(config::fetch_models(&fetch_url, &fetch_key));
+                            });
+                            let result = loop {
+                                while let Ok(ev) = event_rx.try_recv() {
+                                    match ev {
+                                        Event::Tick => {
+                                            state.advance_cat_anim();
+                                            state.spinner.frame = (state.spinner.frame + 1) % 10;
+                                            state.render();
+                                        }
+                                        Event::Resize => { state.update_dimensions(); state.render(); }
+                                        _ => {}
+                                    }
+                                }
+                                match model_rx.recv_timeout(Duration::from_millis(16)) {
+                                    Ok(r) => break r,
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                    Err(_) => break Err("Fetch thread died".into()),
+                                }
+                            };
+                            state.stop_spinner();
+                            let models = match result {
+                                Ok(m) => {
+                                    if let Ok(mut guard) = AVAILABLE_MODELS.lock() { *guard = m.clone(); }
+                                    m
+                                }
+                                Err(e) => {
+                                    state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Model fetch failed: {e}") });
+                                    state.render();
+                                    continue;
+                                }
+                            };
+                            state.render();
                             if models.is_empty() {
                                 state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: format!("Model: {}", config.llm.model) });
                             } else {

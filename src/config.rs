@@ -45,17 +45,18 @@ impl ModelInfo {
 }
 
 /// Fetch models — tries LMStudio native API first, falls back to OpenAI compat
-pub fn fetch_models(api_url: &str, api_key: &str) -> Vec<ModelInfo> {
+pub fn fetch_models(api_url: &str, api_key: &str) -> Result<Vec<ModelInfo>, String> {
     // Derive base URL from chat/completions URL
     let base = api_url
         .replace("/v1/chat/completions", "")
         .replace("/chat/completions", "");
 
-    // Try LMStudio native API first: /api/v1/models
+    // Try LMStudio native API first (only for localhost — skip for remote providers)
+    let is_local = base.contains("127.0.0.1") || base.contains("localhost");
     let lms_url = format!("{}/api/v1/models", base);
-    if let Ok(resp) = ureq::get(&lms_url)
+    if is_local { if let Ok(resp) = ureq::get(&lms_url)
         .set("Authorization", &format!("Bearer {}", api_key))
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(2))
         .call()
     {
         if let Ok(body) = resp.into_string() {
@@ -85,33 +86,36 @@ pub fn fetch_models(api_url: &str, api_key: &str) -> Vec<ModelInfo> {
                         .collect();
                     result.sort_by(|a, b| a.display_name.cmp(&b.display_name));
                     if !result.is_empty() {
-                        return result;
+                        return Ok(result);
                     }
                 }
             }
         }
-    }
+    } }
 
     // Fallback: OpenAI-compatible /v1/models
     let oai_url = format!("{}/v1/models", base);
     let resp = ureq::get(&oai_url)
         .set("Authorization", &format!("Bearer {}", api_key))
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .call();
     match resp {
         Ok(r) => {
-            let body = r.into_string().unwrap_or_default();
-            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let body = r.into_string().map_err(|e| format!("Failed to read response: {e}"))?;
+            let parsed: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("Invalid JSON: {e}"))?;
             let mut result: Vec<ModelInfo> = parsed["data"]
                 .as_array()
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|m| {
                             let id = m["id"].as_str()?.to_string();
+                            let name = m["name"].as_str().unwrap_or(&id).to_string();
+                            let ctx = m["context_length"].as_u64().unwrap_or(4096) as usize;
                             Some(ModelInfo {
-                                display_name: id.clone(),
+                                display_name: name,
                                 key: id,
-                                context_length: 4096,
+                                context_length: ctx,
                                 vision: false,
                                 tool_use: false,
                             })
@@ -119,10 +123,14 @@ pub fn fetch_models(api_url: &str, api_key: &str) -> Vec<ModelInfo> {
                         .collect()
                 })
                 .unwrap_or_default();
-            result.sort_by(|a, b| a.key.cmp(&b.key));
-            result
+            result.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+            if result.is_empty() {
+                Err("No models found in response".into())
+            } else {
+                Ok(result)
+            }
         }
-        Err(_) => Vec::new(),
+        Err(e) => Err(format!("Request failed: {e}")),
     }
 }
 
@@ -416,7 +424,7 @@ fn run_setup_wizard() -> LoadedConfig {
     // Fetch models (uses LMStudio native API if available)
     print!("\n  {DIM}Fetching models...{RESET}");
     let _ = io::stdout().flush();
-    let models = fetch_models(&api_url, &api_key);
+    let models = fetch_models(&api_url, &api_key).unwrap_or_default();
     print!("\r\x1b[2K");
     let _ = io::stdout().flush();
 

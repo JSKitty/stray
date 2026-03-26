@@ -3,7 +3,7 @@ name = "stray"
 version = "0.1.0"
 edition = "2021"
 description = "A living AI companion — autonomous, sovereign, with a heartbeat"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [[bin]]
 name = "stray"
