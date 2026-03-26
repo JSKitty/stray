@@ -113,12 +113,11 @@ impl Tool for BashTool {
     }
 
     fn display_action(&self, input: &str) -> String {
-        let cmd = super::truncate_middle(input.trim(), 60);
-        format!("Running {}", cmd)
+        super::truncate_middle(input.trim(), 60)
     }
 
     fn execute(&self, input: &str) -> String {
-        // Check blocklist before execution
+        // Fallback synchronous execution (used when spawn + interactive poll isn't available)
         if let Some(reason) = Self::check_blocked(input) {
             return reason;
         }
@@ -126,7 +125,7 @@ impl Tool for BashTool {
         let mut child = match Command::new("bash")
             .arg("-c")
             .arg(input)
-            .stdin(std::process::Stdio::null()) // no interactive input
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -142,10 +141,7 @@ impl Tool for BashTool {
                 Ok(None) => {
                     if start.elapsed() >= COMMAND_TIMEOUT {
                         let _ = child.kill();
-                        return format!(
-                            "[TIMEOUT] Command killed after {}s",
-                            COMMAND_TIMEOUT.as_secs()
-                        );
+                        return format!("[TIMEOUT] Command killed after {}s", COMMAND_TIMEOUT.as_secs());
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -154,38 +150,50 @@ impl Tool for BashTool {
         };
 
         match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let mut result = String::new();
-
-                if !stdout.is_empty() {
-                    result.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str("[stderr] ");
-                    result.push_str(&stderr);
-                }
-                if result.is_empty() {
-                    return format!("[exit code {}]", out.status.code().unwrap_or(-1));
-                }
-
-                if result.len() > MAX_OUTPUT {
-                    let mut end = MAX_OUTPUT;
-                    while end > 0 && !result.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    result.truncate(end);
-                    result.push_str("\n[output truncated]");
-                }
-                result
-            }
+            Ok(out) => self.format_output(&out),
             Err(e) => format!("[error] {}", e),
         }
     }
+
+    fn spawn(&self, input: &str) -> Option<Result<std::process::Child, String>> {
+        if let Some(reason) = Self::check_blocked(input) {
+            return Some(Err(reason));
+        }
+        Some(Command::new("bash")
+            .arg("-c")
+            .arg(input)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("[error] Failed to spawn: {e}")))
+    }
+
+    fn format_output(&self, out: &std::process::Output) -> String {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut result = String::new();
+
+        if !stdout.is_empty() { result.push_str(&stdout); }
+        if !stderr.is_empty() {
+            if !result.is_empty() { result.push('\n'); }
+            result.push_str("[stderr] ");
+            result.push_str(&stderr);
+        }
+        if result.is_empty() {
+            return format!("[exit code {}]", out.status.code().unwrap_or(-1));
+        }
+
+        if result.len() > MAX_OUTPUT {
+            let mut end = MAX_OUTPUT;
+            while end > 0 && !result.is_char_boundary(end) { end -= 1; }
+            result.truncate(end);
+            result.push_str("\n[output truncated]");
+        }
+        result
+    }
+
+    fn timeout(&self) -> Duration { COMMAND_TIMEOUT }
 }
 
 #[cfg(test)]

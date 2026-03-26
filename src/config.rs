@@ -66,10 +66,17 @@ pub fn fetch_models(api_url: &str, api_key: &str) -> Vec<ModelInfo> {
                         .filter(|m| m["type"].as_str() != Some("embedding"))
                         .map(|m| {
                             let caps = &m["capabilities"];
+                            let native_ctx = m["max_context_length"].as_u64().unwrap_or(4096) as usize;
+                            // Prefer loaded instance's configured context (user may limit for vRAM)
+                            let loaded_ctx = m["loaded_instances"]
+                                .as_array()
+                                .and_then(|instances| instances.first())
+                                .and_then(|inst| inst["config"]["context_length"].as_u64())
+                                .map(|c| c as usize);
                             ModelInfo {
                                 key: m["key"].as_str().unwrap_or("").to_string(),
                                 display_name: m["display_name"].as_str().unwrap_or("").to_string(),
-                                context_length: m["max_context_length"].as_u64().unwrap_or(4096) as usize,
+                                context_length: loaded_ctx.unwrap_or(native_ctx),
                                 vision: caps["vision"].as_bool().unwrap_or(false),
                                 tool_use: caps["trained_for_tool_use"].as_bool().unwrap_or(false),
                             }
@@ -249,7 +256,7 @@ pub fn expand_env_vars(input: &str) -> String {
 // Platform data directories
 // ---------------------------------------------------------------------------
 
-fn global_config_dir() -> Option<PathBuf> {
+pub fn global_config_dir() -> Option<PathBuf> {
     global_data_base().map(|base| base.join(APP_ID))
 }
 
@@ -441,7 +448,7 @@ fn run_setup_wizard() -> LoadedConfig {
         }
         println!();
         let choice = wizard_prompt("Pick", "1");
-        let idx = choice.parse::<usize>().unwrap_or(1).saturating_sub(1).min(models.len() - 1);
+        let idx = choice.parse::<usize>().unwrap_or(1).saturating_sub(1).min(models.len().saturating_sub(1));
         let selected = &models[idx];
 
         println!("  {DIM}Auto-detected:{RESET} vision={}{}, context={}",
@@ -458,10 +465,11 @@ fn run_setup_wizard() -> LoadedConfig {
     // Agent name
     let name = wizard_prompt("Agent name", "Stray");
 
-    // Build TOML
+    // Build TOML (escape special chars to prevent injection)
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let toml_content = format!(
         r#"[agent]
-name = "{name}"
+name = "{}"
 heartbeat = 300
 compact_at = {compact_at}
 system_prompt = """
@@ -470,12 +478,13 @@ Be concise. Only run commands when needed.
 """
 
 [llm]
-api_url = "{api_url}"
-api_key = "{api_key}"
-model = "{model}"
+api_url = "{}"
+api_key = "{}"
+model = "{}"
 max_tokens = 4096
 vision = {vision}
-"#
+"#,
+        esc(&name), esc(&api_url), esc(&api_key), esc(&model)
     );
 
     // Write to global config dir
@@ -505,7 +514,14 @@ vision = {vision}
 
     restore_terminal();
 
-    let config: Config = toml::from_str(&toml_content).unwrap();
+    let config: Config = match toml::from_str(&toml_content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  {RED}Generated config is invalid: {e}{RESET}");
+            eprintln!("  Please edit {} manually.", config_path.display());
+            std::process::exit(1);
+        }
+    };
     LoadedConfig {
         config,
         source: ConfigSource::Wizard,

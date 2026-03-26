@@ -1,6 +1,6 @@
 //! Event system — channels, input thread, tick thread, resize watcher.
 
-use crate::term::{enable_raw_mode, read_key, Key};
+use crate::term::{read_key, Key};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -20,7 +20,6 @@ pub fn setup_event_channels() -> Receiver<Event> {
     let is_tty = crate::term::is_tty();
     if is_tty {
         thread::spawn(move || {
-            let _orig = enable_raw_mode();
             loop {
                 if let Some(key) = read_key() {
                     if tx_input.send(Event::Key(key)).is_err() {
@@ -92,6 +91,15 @@ fn setup_resize_watcher(tx: Sender<Event>) {
     });
 }
 
+/// Install signal handlers as a safety net — restores terminal on SIGINT/SIGTERM
+/// even if the event loop is stuck.
+pub fn setup_signal_handlers() {
+    unsafe {
+        libc::signal(libc::SIGINT, fatal_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, fatal_signal_handler as *const () as libc::sighandler_t);
+    }
+}
+
 static RESIZE_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 extern "C" fn sigwinch_handler(_: libc::c_int) {
@@ -101,5 +109,23 @@ extern "C" fn sigwinch_handler(_: libc::c_int) {
             let buf: [u8; 1] = [1];
             let _ = libc::write(fd, buf.as_ptr() as *const libc::c_void, 1);
         }
+    }
+}
+
+extern "C" fn fatal_signal_handler(sig: libc::c_int) {
+    // Restore terminal and exit — last resort for external kill signals.
+    // Note: keyboard Ctrl+C goes through the event loop (ISIG is disabled),
+    // so this handler only fires from external `kill -2` / `kill -15`.
+    unsafe {
+        // Leave alternate screen + restore cursor + disable bracketed paste
+        let msg = b"\x1b[?1049l\x1b[0 q\x1b[?2004l";
+        let _ = libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        // Restore termios — use try_lock to avoid deadlock if mutex is held
+        if let Ok(guard) = crate::term::ORIG_TERMIOS.try_lock() {
+            if let Some(ref orig) = *guard {
+                libc::tcsetattr(0, libc::TCSAFLUSH, orig);
+            }
+        }
+        libc::_exit(128 + sig);
     }
 }

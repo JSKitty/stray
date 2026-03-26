@@ -1,6 +1,7 @@
 mod config;
 mod event;
 mod formats;
+mod highlight;
 mod markdown;
 mod term;
 mod tools;
@@ -9,10 +10,8 @@ mod ui;
 use config::{Config, ConfigSource, LlmConfig};
 use event::Event;
 use formats::ModelFormat;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{BufRead, BufReader};
-use std::process::Command;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use term::*;
@@ -27,9 +26,18 @@ const CHARS_PER_TOKEN: usize = 4;
 // LLM client
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone, Copy)]
+enum Role { System, User, Assistant }
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self { Role::System => "system", Role::User => "user", Role::Assistant => "assistant" }
+    }
+}
+
+#[derive(Clone)]
 struct Message {
-    role: String,
+    role: Role,
     content: String,
 }
 
@@ -57,9 +65,9 @@ fn message_to_json(msg: &Message, vision: bool) -> serde_json::Value {
         if !trailing.is_empty() {
             parts.push(json!({"type": "text", "text": trailing}));
         }
-        json!({"role": msg.role, "content": parts})
+        json!({"role": msg.role.as_str(), "content": parts})
     } else {
-        json!({"role": msg.role, "content": msg.content})
+        json!({"role": msg.role.as_str(), "content": msg.content})
     }
 }
 
@@ -101,6 +109,8 @@ fn call_llm(
     let body_str = body.to_string();
     let api_url = config.api_url.clone();
     let api_key = config.api_key.clone();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled_bg = cancelled.clone();
 
     let (sse_tx, sse_rx) = std::sync::mpsc::channel::<Result<String, String>>();
     std::thread::spawn(move || {
@@ -118,6 +128,7 @@ fn call_llm(
         };
         let reader = BufReader::new(resp.into_reader());
         for line in reader.lines() {
+            if cancelled_bg.load(std::sync::atomic::Ordering::Relaxed) { break; }
             match line {
                 Ok(l) => { if sse_tx.send(Ok(l)).is_err() { break; } }
                 Err(_) => { let _ = sse_tx.send(Err("Stream read error".into())); break; }
@@ -130,6 +141,7 @@ fn call_llm(
     let mut total_tokens: Option<usize> = None;
     let mut streaming_started = false;
     let mut was_disturbed = false;
+    let mut received_done = false;
     let mut tag_buf = String::new();
     let mut inside_tool_tag = false;
 
@@ -152,8 +164,10 @@ fn call_llm(
                     }
                     Event::Tick => {
                         if let Some(ref mut s) = state {
+                            s.advance_cat_anim();
+                            s.tick_fade();
                             if s.spinner.active {
-                                s.spinner.frame += 1;
+                                s.spinner.frame = (s.spinner.frame + 1) % 10;
                             }
                             s.render();
                         }
@@ -162,27 +176,32 @@ fn call_llm(
                     Event::Key(key) => {
                         if let Some(ref mut s) = state {
                             match key {
-                                Key::Char(ch) => { s.input.buf.insert(s.input.cursor, ch); s.input.cursor += 1; }
-                                Key::Paste(text) => { for ch in text.chars() { s.input.buf.insert(s.input.cursor, ch); s.input.cursor += 1; } }
-                                Key::Backspace => { if s.input.cursor > 0 { s.input.buf.remove(s.input.cursor - 1); s.input.cursor -= 1; } }
-                                Key::Delete => { if s.input.cursor < s.input.buf.len() { s.input.buf.remove(s.input.cursor); } }
-                                Key::Left => { if s.input.cursor > 0 { s.input.cursor -= 1; } }
-                                Key::Right => { if s.input.cursor < s.input.buf.len() { s.input.cursor += 1; } }
-                                Key::Home => { s.input.cursor = 0; }
-                                Key::End => { s.input.cursor = s.input.buf.len(); }
+                                Key::Char(ch) => { s.input.insert(ch); }
+                                Key::ShiftEnter => { s.input.insert('\n'); }
+                                Key::Paste(text) => { s.input.insert_str(&text); }
+                                Key::Backspace => { s.input.backspace(); }
+                                Key::Delete => { s.input.delete(); }
+                                Key::Left => { s.input.move_left(); }
+                                Key::Right => { s.input.move_right(); }
+                                Key::Home => { s.input.move_home(); }
+                                Key::End => { s.input.move_end(); }
                                 Key::Enter => {
-                                    let line: String = s.input.buf.drain(..).collect();
-                                    s.input.cursor = 0;
+                                    let line = s.input.drain_all();
                                     let trimmed = line.trim().to_string();
                                     if !trimmed.is_empty() {
-                                        queued_messages.push(trimmed.clone());
-                                        s.push_chat(ChatLine { kind: ChatLineKind::QueuedMessage, content: trimmed });
+                                        if trimmed.starts_with('/') {
+                                            handle_inline_slash(&trimmed, s, messages);
+                                        } else {
+                                            queued_messages.push(trimmed.clone());
+                                            s.push_chat(ChatLine { kind: ChatLineKind::QueuedMessage, content: trimmed });
+                                        }
                                     }
                                 }
                                 Key::Tab => {
-                                    let suggestion = slash_suggestion(&s.input.buf);
-                                    for ch in suggestion.chars() { s.input.buf.push(ch); }
-                                    s.input.cursor = s.input.buf.len();
+                                    let chars = s.input.to_chars();
+                                    let suggestion = slash_suggestion(&chars);
+                                    s.input.move_end();
+                                    s.input.insert_str(&suggestion);
                                 }
                                 _ => {}
                             }
@@ -192,7 +211,10 @@ fn call_llm(
                 }
             }
         }
-        if was_disturbed { break; }
+        if was_disturbed {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
 
         // Poll SSE reader with short timeout (keeps UI responsive)
         let line = match sse_rx.recv_timeout(Duration::from_millis(16)) {
@@ -218,7 +240,7 @@ fn call_llm(
             None => continue,
         };
 
-        if data == "[DONE]" { break; }
+        if data == "[DONE]" { received_done = true; break; }
 
         let chunk: serde_json::Value = match serde_json::from_str(data) {
             Ok(v) => v,
@@ -247,6 +269,12 @@ fn call_llm(
                         }
                         if ch == '<' || !tag_buf.is_empty() {
                             tag_buf.push(ch);
+                            // Safety: flush oversized tag buffers as literal text
+                            if tag_buf.len() > 128 && !inside_tool_tag {
+                                display_text.push_str(&tag_buf);
+                                tag_buf.clear();
+                                continue;
+                            }
                             if ch == '>' {
                                 if tool_tags.iter().any(|t| tag_buf == format!("<{t}>")) {
                                     inside_tool_tag = true;
@@ -273,6 +301,7 @@ fn call_llm(
                         } else {
                             s.append_streaming(&display_text);
                         }
+                        s.tick_fade();
                         s.maybe_render();
                     }
                 }
@@ -301,11 +330,26 @@ fn call_llm(
         }
     }
 
+    // Flush any leftover tag buffer (partial tag at end of stream)
+    if !tag_buf.is_empty() && !inside_tool_tag {
+        if let Some(ref mut s) = state {
+            if streaming_started {
+                s.append_streaming(&tag_buf);
+            }
+        }
+        content.push_str(&tag_buf);
+    }
+
+    // Stream ended without data: [DONE] — server disconnected or thread died
+    if !received_done && !was_disturbed && streaming_started {
+        was_disturbed = true;
+    }
+
     // Finalize streaming
     if streaming_started {
         if was_disturbed {
             if let Some(ref mut s) = state {
-                s.append_streaming(" [disturbed]");
+                s.append_streaming(&format!(" {DIM}[disturbed]{RESET}"));
             }
         }
         if let Some(ref mut s) = state {
@@ -315,7 +359,7 @@ fn call_llm(
     } else if was_disturbed {
         if let Some(ref mut s) = state {
             s.stop_spinner();
-            s.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: "  [disturbed]".into() });
+            s.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: format!("{DIM}[disturbed]{RESET}") });
             s.render();
         }
     }
@@ -370,30 +414,35 @@ will be replaced by your summary. Preserve EVERYTHING important:\n\
 Be thorough but concise. This summary is your ONLY memory — anything you don't include is lost forever. \
 Write in first person as if briefing your future self.";
 
-fn compact_context(config: &LlmConfig, messages: &mut Vec<Message>, token_count: usize, state: &mut AppState) {
+fn compact_context(
+    config: &LlmConfig, messages: &mut Vec<Message>, token_count: usize,
+    state: &mut AppState, event_rx: &Receiver<Event>,
+) {
     state.push_chat(ChatLine {
         kind: ChatLineKind::SystemInfo,
-        content: format!("[compact] Context at ~{token_count} tokens — compacting..."),
+        content: format!("[compact] Context at ~{token_count} tokens"),
     });
+    state.start_spinner("compacting...");
     state.render();
 
-    messages.push(Message { role: "user".into(), content: COMPACT_PROMPT.into() });
+    messages.push(Message { role: Role::User, content: COMPACT_PROMPT.into() });
 
-    let resp = match call_llm(config, messages, &None, None, None, &[], &mut Vec::new()) {
+    let resp = match call_llm(config, messages, &None, Some(state), Some(event_rx), &[], &mut Vec::new()) {
         Ok(r) => r,
         Err(e) => {
             messages.pop();
+            state.stop_spinner();
             state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("[compact] Failed: {e}") });
             state.render();
             return;
         }
     };
 
-    let system = messages.first().cloned().unwrap_or(Message { role: "system".into(), content: String::new() });
+    let system = messages.first().cloned().unwrap_or(Message { role: Role::System, content: String::new() });
     messages.clear();
     messages.push(system);
     messages.push(Message {
-        role: "assistant".into(),
+        role: Role::Assistant,
         content: format!("[Context compacted from ~{token_count} tokens]\n\n{}", resp.content),
     });
 
@@ -423,13 +472,13 @@ fn run_heartbeat(
 ) -> (Option<usize>, Vec<String>) {
     if user_messages.is_empty() {
         messages.push(Message {
-            role: "user".into(),
+            role: Role::User,
             content: format!("[{}] Heartbeat. Check in and do your tasks.", timestamp()),
         });
     } else {
         let combined = user_messages.join("\n\n");
         messages.push(Message {
-            role: "user".into(),
+            role: Role::User,
             content: format!("[{}] The operator says:\n{}", timestamp(), combined),
         });
     }
@@ -455,42 +504,136 @@ fn run_heartbeat(
         }
 
         if resp.disturbed {
+            state.cat_anim.play(CatAnimKind::Squint);
+            state.render();
             let partial = if resp.content.trim().is_empty() {
                 "[no response generated]".to_string()
             } else {
                 format!("{} [interrupted]", resp.content)
             };
-            messages.push(Message { role: "assistant".into(), content: partial });
+            messages.push(Message { role: Role::Assistant, content: partial });
             messages.push(Message {
-                role: "user".into(),
+                role: Role::User,
                 content: format!("[{}] You were disturbed by the operator — your previous response was cut short.", timestamp()),
             });
             break;
         }
 
         let (calls, _) = format.parse_response(&resp.content);
-        messages.push(Message { role: "assistant".into(), content: resp.content });
+        messages.push(Message { role: Role::Assistant, content: resp.content });
 
         if calls.is_empty() { break; }
 
-        // Execute tool calls
-        state.start_spinner("executing...");
-        state.render();
+        // Execute tool calls (with spinner + ESC cancel)
         let mut results: Vec<(String, String, String)> = Vec::new();
+        let mut tool_cancelled = false;
         for call in &calls {
+            if tool_cancelled { break; }
             let tool = registry.tools().iter().find(|t| t.name() == call.tool);
             match tool {
                 Some(t) => {
                     let action = t.display_action(&call.input);
-                    let title = t.name().chars().next().unwrap_or(' ').to_uppercase().to_string()
-                        + &t.name()[1..];
+                    let mut name_chars = t.name().chars();
+                    let title = match name_chars.next() {
+                        Some(c) => format!("{}{}", c.to_uppercase(), name_chars.as_str()),
+                        None => String::new(),
+                    };
                     state.stop_spinner();
                     state.push_chat(ChatLine {
                         kind: ChatLineKind::ToolAction,
                         content: format!("{title} → {action}"),
                     });
-                    state.render();
-                    let output = t.execute(&call.input);
+
+                    let output = if let Some(spawn_result) = t.spawn(&call.input) {
+                        // Non-blocking: poll child with spinner + ESC cancel
+                        match spawn_result {
+                            Ok(mut child) => {
+                                let timeout = t.timeout();
+                                let start = std::time::Instant::now();
+                                state.start_spinner(&format!("{title}..."));
+                                state.render();
+                                loop {
+                                    while let Ok(ev) = event_rx.try_recv() {
+                                        match ev {
+                                            Event::Key(Key::CtrlC) | Event::Key(Key::Escape) => {
+                                                let _ = child.kill();
+                                                tool_cancelled = true;
+                                            }
+                                            Event::Tick => {
+                                                state.advance_cat_anim();
+                                                state.spinner.frame = (state.spinner.frame + 1) % 10;
+                                                state.tick_fade();
+                                                state.render();
+                                            }
+                                            Event::Resize => {
+                                                state.update_dimensions();
+                                                state.render();
+                                            }
+                                            Event::Key(key) => {
+                                                match key {
+                                                    Key::Char(ch) => { state.input.insert(ch); }
+                                                    Key::ShiftEnter => { state.input.insert('\n'); }
+                                                    Key::Paste(text) => { state.input.insert_str(&text); }
+                                                    Key::Backspace => { state.input.backspace(); }
+                                                    Key::Delete => { state.input.delete(); }
+                                                    Key::Left => { state.input.move_left(); }
+                                                    Key::Right => { state.input.move_right(); }
+                                                    Key::Home => { state.input.move_home(); }
+                                                    Key::End => { state.input.move_end(); }
+                                                    Key::Enter => {
+                                                        let line = state.input.drain_all();
+                                                        let trimmed = line.trim().to_string();
+                                                        if !trimmed.is_empty() {
+                                                            if trimmed.starts_with('/') {
+                                                                handle_inline_slash(&trimmed, state, messages);
+                                                            } else {
+                                                                queued_messages.push(trimmed.clone());
+                                                                state.push_chat(ChatLine { kind: ChatLineKind::QueuedMessage, content: trimmed });
+                                                            }
+                                                        }
+                                                    }
+                                                    Key::Tab => {
+                                                        let chars = state.input.to_chars();
+                                                        let suggestion = slash_suggestion(&chars);
+                                                        state.input.move_end();
+                                                        state.input.insert_str(&suggestion);
+                                                    }
+                                                    _ => {}
+                                                }
+                                                state.render();
+                                            }
+                                        }
+                                    }
+                                    if tool_cancelled {
+                                        let _ = child.kill();
+                                        break "[cancelled by user]".to_string();
+                                    }
+                                    match child.try_wait() {
+                                        Ok(Some(_)) => {
+                                            break match child.wait_with_output() {
+                                                Ok(out) => t.format_output(&out),
+                                                Err(e) => format!("[error] {e}"),
+                                            };
+                                        }
+                                        Ok(None) => {
+                                            if start.elapsed() >= timeout {
+                                                let _ = child.kill();
+                                                break format!("[TIMEOUT] Command killed after {}s", timeout.as_secs());
+                                            }
+                                        }
+                                        Err(e) => break format!("[error] {e}"),
+                                    }
+                                    std::thread::sleep(Duration::from_millis(16));
+                                }
+                            }
+                            Err(e) => e,
+                        }
+                    } else {
+                        // Synchronous for fast tools (read, etc.)
+                        state.render();
+                        t.execute(&call.input)
+                    };
+
                     results.push((call.tool.clone(), call.input.clone(), output));
                     state.start_spinner("thinking...");
                     state.render();
@@ -501,7 +644,19 @@ fn run_heartbeat(
             }
         }
 
-        messages.push(Message { role: "user".into(), content: format.format_results(&results) });
+        if tool_cancelled {
+            state.stop_spinner();
+            state.cat_anim.play(CatAnimKind::Squint);
+            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: "[tool cancelled]".into() });
+            messages.push(Message {
+                role: Role::User,
+                content: format!("[{}] Tool execution was cancelled by the operator.", timestamp()),
+            });
+            state.render();
+            break;
+        }
+
+        messages.push(Message { role: Role::User, content: format.format_results(&results) });
 
         if round == MAX_TOOL_ROUNDS - 1 {
             state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Max tool rounds ({MAX_TOOL_ROUNDS}) reached") });
@@ -522,6 +677,290 @@ fn build_system_prompt(config: &Config, format: &dyn ModelFormat, registry: &Too
         "{}\n\nToday is {}. Timestamps in messages are local time (HH:MM). Working directory: {}{}",
         config.agent.system_prompt, date_today(), cwd, format.system_prompt_suffix(registry)
     )
+}
+
+// ---------------------------------------------------------------------------
+// Config menu system — modular field definitions
+// ---------------------------------------------------------------------------
+
+/// Config fields: (key, label, description). Adding a new setting = adding one line here.
+const CONFIG_FIELDS: &[(&str, &str, &str)] = &[
+    ("provider", "Provider", "The LLM API provider to connect to"),
+    ("name", "Agent Name", "Your companion's name, shown in the header and system prompt"),
+    ("heartbeat", "Heartbeat", "Seconds between autonomous check-ins (0 to disable)"),
+    ("system_prompt", "System Prompt", "Instructions that define the agent's personality and behavior"),
+];
+
+/// Known providers: (display_name, api_url, api_key)
+const PROVIDERS: &[(&str, &str, &str)] = &[
+    ("LMStudio", "http://127.0.0.1:1234/v1/chat/completions", "lm-studio"),
+    ("PPQ", "https://api.ppq.ai/v1/chat/completions", ""),
+];
+
+fn detect_provider(api_url: &str) -> String {
+    if api_url.contains("127.0.0.1:1234") || api_url.contains("localhost:1234") {
+        "LMStudio".into()
+    } else if api_url.contains("ppq.ai") {
+        "PPQ".into()
+    } else {
+        "Custom".into()
+    }
+}
+
+fn get_config_value(config: &Config, key: &str) -> String {
+    match key {
+        "provider" => detect_provider(&config.llm.api_url),
+        "name" => config.agent.name.clone(),
+        "heartbeat" => format!("{}s", config.agent.heartbeat),
+        "system_prompt" => {
+            let s = config.agent.system_prompt.lines().next().unwrap_or("").trim();
+            let truncated: String = s.chars().take(40).collect();
+            if s.chars().count() > 40 { format!("{truncated}...") } else { truncated }
+        }
+        _ => String::new(),
+    }
+}
+
+fn open_config_selector(state: &mut AppState, id: &str, config: &Config) {
+    let parts: Vec<&str> = id.split(':').collect();
+    match parts.as_slice() {
+        ["config"] => {
+            state.input_label = "Config".into();
+            state.selector = Some(Selector::new("config", vec![
+                SelectorItem { label: "Local (workspace)".into(), value: "local".into() },
+                SelectorItem { label: "Global".into(), value: "global".into() },
+            ], 2));
+        }
+        ["config", scope] => {
+            let scope_label = if *scope == "local" { "Local" } else { "Global" };
+            state.input_label = format!("Config · {scope_label}");
+            let items: Vec<SelectorItem> = CONFIG_FIELDS.iter().map(|(key, label, _desc)| {
+                let val = get_config_value(config, key);
+                let display = if val.is_empty() { label.to_string() } else { format!("{label}: {val}") };
+                SelectorItem { label: display, value: key.to_string() }
+            }).collect();
+            state.selector = Some(Selector::new(id, items, CONFIG_FIELDS.len().min(8)));
+        }
+        ["config", scope, sub] => {
+            let scope_label = if *scope == "local" { "Local" } else { "Global" };
+            let mut sub_label = sub.to_string();
+            if let Some(c) = sub_label.get_mut(0..1) { c.make_ascii_uppercase(); }
+            state.input_label = format!("Config · {scope_label} · {sub_label}");
+            if *sub == "provider" {
+                let current = detect_provider(&config.llm.api_url);
+                let items: Vec<SelectorItem> = PROVIDERS.iter().map(|(name, _, _)| {
+                    SelectorItem { label: name.to_string(), value: name.to_lowercase() }
+                }).collect();
+                let mut sel = Selector::new(id, items, PROVIDERS.len());
+                if let Some(idx) = PROVIDERS.iter().position(|(n, _, _)| *n == current) {
+                    sel.selected = idx;
+                }
+                state.selector = Some(sel);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn save_config_field(scope: &str, field: &str, value: &str) -> Result<std::path::PathBuf, String> {
+    let path = match scope {
+        "local" => std::path::PathBuf::from("stray.toml"),
+        "global" => {
+            let dir = config::global_config_dir().ok_or("No global config directory")?;
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            dir.join("stray.toml")
+        }
+        _ => return Err("Unknown scope".into()),
+    };
+
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml::Value = content.parse()
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let table = doc.as_table_mut().ok_or("Invalid TOML")?;
+
+    match field {
+        "provider" => {
+            let (_, url, key) = PROVIDERS.iter()
+                .find(|(n, _, _)| n.to_lowercase() == value)
+                .ok_or("Unknown provider")?;
+            let llm = table.entry("llm")
+                .or_insert(toml::Value::Table(toml::map::Map::new()));
+            if let Some(t) = llm.as_table_mut() {
+                t.insert("api_url".into(), toml::Value::String(url.to_string()));
+                if !key.is_empty() {
+                    t.insert("api_key".into(), toml::Value::String(key.to_string()));
+                }
+            }
+        }
+        "heartbeat" => {
+            let secs: u64 = value.trim().trim_end_matches('s').parse()
+                .map_err(|_| "Invalid number".to_string())?;
+            let sec = table.entry("agent")
+                .or_insert(toml::Value::Table(toml::map::Map::new()));
+            if let Some(t) = sec.as_table_mut() {
+                t.insert("heartbeat".into(), toml::Value::Integer(secs as i64));
+            }
+        }
+        "name" | "system_prompt" => {
+            let section = "agent";
+            let toml_key = if field == "name" { "name" } else { "system_prompt" };
+            let sec = table.entry(section)
+                .or_insert(toml::Value::Table(toml::map::Map::new()));
+            if let Some(t) = sec.as_table_mut() {
+                t.insert(toml_key.into(), toml::Value::String(value.into()));
+            }
+        }
+        _ => return Err(format!("Unknown field: {field}")),
+    }
+
+    let output = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &output).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+fn save_model_to_config(path: &std::path::Path, model: &str) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: toml::Value = content.parse()
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let table = doc.as_table_mut().ok_or("Invalid TOML")?;
+    let llm = table.entry("llm")
+        .or_insert(toml::Value::Table(toml::map::Map::new()));
+    if let Some(t) = llm.as_table_mut() {
+        t.insert("model".into(), toml::Value::String(model.into()));
+    }
+    let output = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(path, output).map_err(|e| e.to_string())
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let cmd = if cfg!(target_os = "macos") { "pbcopy" }
+        else if cfg!(target_os = "windows") { "clip" }
+        else { "xclip -selection clipboard" };
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let mut child = std::process::Command::new(parts[0])
+        .args(&parts[1..])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| "No clipboard tool found (pbcopy/xclip/clip)".to_string())?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        std::io::Write::write_all(stdin, text.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    child.wait().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Handle safe slash commands during agent execution. Returns true if handled.
+fn handle_inline_slash(
+    trimmed: &str, state: &mut AppState, messages: &[Message],
+) -> bool {
+    let cmd = trimmed.split_whitespace().next().unwrap_or("");
+    state.push_chat(ChatLine { kind: ChatLineKind::UserMessage, content: trimmed.to_string() });
+    match cmd {
+        "/help" => {
+            let cmds: Vec<_> = SLASH_COMMANDS.iter().filter(|(n, _)| *n != "/help").collect();
+            let name_w = cmds.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+            let mut help = String::new();
+            for (name, desc) in cmds {
+                help.push_str(&format!("  {CYAN}{name:<name_w$}{RESET}  {DIM}{desc}{RESET}\n"));
+            }
+            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: help.trim_end().to_string() });
+        }
+        "/copy" => {
+            let last_agent = state.chat.iter().rev()
+                .find(|l| matches!(l.kind, ChatLineKind::AgentText | ChatLineKind::AgentStreaming));
+            if let Some(line) = last_agent {
+                match copy_to_clipboard(line.content.trim()) {
+                    Ok(()) => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: "Copied to clipboard".into() }),
+                    Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e }),
+                }
+            } else {
+                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: "No agent response to copy".into() });
+            }
+        }
+        "/context" => {
+            let est = estimate_tokens(messages);
+            state.push_chat(ChatLine {
+                kind: ChatLineKind::SystemInfo,
+                content: format!("Context: ~{est} tokens ({} messages)", messages.len()),
+            });
+        }
+        "/exit" => {
+            print!("\x1b[?1049l");
+            restore_terminal();
+            std::process::exit(0);
+        }
+        _ => {
+            // Known but unsafe command, or unknown — don't queue as message
+            if SLASH_COMMANDS.iter().any(|(n, _)| *n == cmd) {
+                // Remove the UserMessage we just pushed (it's not a real message)
+                state.chat.pop();
+                state.push_chat(ChatLine {
+                    kind: ChatLineKind::SystemInfo,
+                    content: format!("{cmd} unavailable during processing"),
+                });
+            } else {
+                state.chat.pop();
+                state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Unknown command: {cmd}") });
+            }
+        }
+    }
+    true
+}
+
+fn fmt_tokens(n: usize) -> String {
+    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
+    else if n >= 10_000 { format!("{}k", n / 1000) }
+    else if n >= 1_000 { format!("{:.1}k", n as f64 / 1000.0) }
+    else { format!("{n}") }
+}
+
+fn format_context_display(messages: &[Message], config: &Config) -> String {
+    let total = estimate_tokens(messages);
+    let system_tokens = if !messages.is_empty() { estimate_tokens(&messages[0..1]) } else { 0 };
+    let msg_tokens = total.saturating_sub(system_tokens);
+    let msg_count = messages.len().saturating_sub(1);
+    let limit = config.agent.compact_at;
+    let pct = if limit > 0 { (total as f64 / limit as f64 * 100.0).min(100.0) as usize } else { 0 };
+
+    // Bar: 20 chars — system (yellow) + messages (cyan) + free (dim)
+    let bar_len = 20usize;
+    let sys_blocks = if limit > 0 {
+        ((system_tokens as f64 / limit as f64) * bar_len as f64).ceil() as usize
+    } else { 0 }.min(bar_len);
+    let msg_blocks = if limit > 0 {
+        ((msg_tokens as f64 / limit as f64) * bar_len as f64).ceil() as usize
+    } else { 0 }.min(bar_len.saturating_sub(sys_blocks));
+    let free_blocks = bar_len.saturating_sub(sys_blocks + msg_blocks);
+    let bar_sys: String = std::iter::repeat('█').take(sys_blocks).collect();
+    let bar_msg: String = std::iter::repeat('█').take(msg_blocks).collect();
+    let bar_free: String = std::iter::repeat('░').take(free_blocks).collect();
+
+    let mut out = String::new();
+    out.push_str(&format!("{DIM}Context{RESET} · {BOLD}{}{RESET}\n", config.llm.model));
+    out.push_str(&format!("\n  {YELLOW}{bar_sys}{RESET}{CYAN}{bar_msg}{RESET}{DIM}{bar_free}{RESET}  {} / {} tokens ({pct}%)\n", fmt_tokens(total), fmt_tokens(limit)));
+    out.push_str(&format!("\n  {YELLOW}█{RESET} {DIM}System     ~{}{RESET}", fmt_tokens(system_tokens)));
+    out.push_str(&format!("\n  {CYAN}█{RESET} {DIM}Messages   ~{} ({msg_count} msgs){RESET}", fmt_tokens(msg_tokens)));
+    out.push_str(&format!("\n  {DIM}░ Free       ~{}{RESET}", fmt_tokens(limit.saturating_sub(total))));
+    out
+}
+
+fn apply_config_change(config: &mut Config, field: &str, value: &str) {
+    match field {
+        "provider" => {
+            if let Some((_, url, key)) = PROVIDERS.iter().find(|(n, _, _)| n.to_lowercase() == value) {
+                config.llm.api_url = url.to_string();
+                if !key.is_empty() { config.llm.api_key = key.to_string(); }
+            }
+        }
+        "name" => config.agent.name = value.to_string(),
+        "heartbeat" => {
+            if let Ok(secs) = value.trim().trim_end_matches('s').parse::<u64>() {
+                config.agent.heartbeat = secs;
+            }
+        }
+        "system_prompt" => config.agent.system_prompt = value.to_string(),
+        _ => {}
+    }
 }
 
 fn main() {
@@ -565,8 +1004,9 @@ fn main() {
     // Fetch models for autocomplete
     update_model_cache(&config.llm.api_url, &config.llm.api_key);
 
-    // Enter alternate screen
-    print!("\x1b[?1049h");
+    // Enter raw mode + alternate screen
+    enable_raw_mode();
+    print!("\x1b[?1049h{CURSOR_BAR}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
     // Build TUI state
@@ -574,10 +1014,13 @@ fn main() {
     state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
     state.render();
 
-    let mut messages: Vec<Message> = vec![Message { role: "system".into(), content: system }];
+    let mut messages: Vec<Message> = vec![Message { role: Role::System, content: system }];
 
     // Event channels (input thread + tick thread + resize watcher)
     let event_rx = event::setup_event_channels();
+
+    // Signal safety net — restores terminal on SIGINT/SIGTERM even if event loop is stuck
+    event::setup_signal_handlers();
 
     // Ctrl+C double-tap state
     let mut last_ctrlc: u64 = 0;
@@ -593,28 +1036,143 @@ fn main() {
 
         'prompt: loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
+            if remaining.is_zero() && config.agent.heartbeat > 0 {
+                state.selector = None;
+                state.input_label.clear(); state.input_hint.clear();
                 break 'prompt; // heartbeat timeout
             }
 
-            match event_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            let timeout = if config.agent.heartbeat == 0 { Duration::from_millis(100) } else { remaining.min(Duration::from_millis(100)) };
+            match event_rx.recv_timeout(timeout) {
                 Ok(Event::Key(key)) => {
+                    // Selector navigation (model picker, etc.)
+                    if state.selector.is_some() {
+                        match key {
+                            Key::Down => {
+                                state.selector.as_mut().unwrap().move_down();
+                                state.render();
+                                continue 'prompt;
+                            }
+                            Key::Up => {
+                                state.selector.as_mut().unwrap().move_up();
+                                state.render();
+                                continue 'prompt;
+                            }
+                            Key::Enter => {
+                                let sel = state.selector.take().unwrap();
+                                let value = sel.items[sel.selected].value.clone();
+                                let sel_id = sel.id;
+
+                                if sel_id == "model" {
+                                    state.input_label.clear(); state.input_hint.clear();
+                                    if value != config.llm.model {
+                                        config.llm.model = value.clone();
+                                        format = formats::format_for_model(&config.llm.model, &registry);
+                                        tools_json = format.format_tools(&registry);
+                                        fmt_str = if tools_json.is_some() { "openai-api" } else { "prompt-xml" };
+                                        if let Some(info) = get_model_info(&value) {
+                                            config.llm.vision = info.vision;
+                                            config.agent.compact_at = (info.context_length as f64 * 0.8) as usize;
+                                        }
+                                        if let Some(msg) = messages.first_mut() {
+                                            msg.content = build_system_prompt(&config, &*format, &registry, &cwd);
+                                        }
+                                        state.push_chat(ChatLine {
+                                            kind: ChatLineKind::SystemInfo,
+                                            content: format!("Switched to {BOLD}{value}{RESET}"),
+                                        });
+                                        state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
+                                        if let Err(e) = save_model_to_config(&config_path, &value) {
+                                            state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Config save failed: {e}") });
+                                        }
+                                    }
+                                } else {
+                                    // Config menu routing (nested selectors)
+                                    let parts: Vec<&str> = sel_id.split(':').collect();
+                                    match parts.as_slice() {
+                                        ["config"] => {
+                                            open_config_selector(&mut state, &format!("config:{value}"), &config);
+                                        }
+                                        ["config", scope] => {
+                                            let scope = scope.to_string();
+                                            match value.as_str() {
+                                                "provider" => {
+                                                    open_config_selector(&mut state, &format!("config:{scope}:provider"), &config);
+                                                }
+                                                field => {
+                                                    // Text input mode
+                                                    let (label, desc) = CONFIG_FIELDS.iter()
+                                                        .find(|f| f.0 == field)
+                                                        .map(|f| (f.1, f.2))
+                                                        .unwrap_or((field, ""));
+                                                    let full_value = match field {
+                                                        "name" => config.agent.name.clone(),
+                                                        "heartbeat" => config.agent.heartbeat.to_string(),
+                                                        "system_prompt" => config.agent.system_prompt.clone(),
+                                                        _ => get_config_value(&config, field),
+                                                    };
+                                                    state.config_edit = Some((scope, field.to_string()));
+                                                    state.input.clear();
+                                                    state.input.insert_str(&full_value);
+                                                    state.input_label = format!("{label} (ESC to cancel)");
+                                                    state.input_hint = desc.to_string();
+                                                }
+                                            }
+                                        }
+                                        ["config", scope, "provider"] => {
+                                            let scope = scope.to_string();
+                                            match save_config_field(&scope, "provider", &value) {
+                                                Ok(_) => {
+                                                    apply_config_change(&mut config, "provider", &value);
+                                                    let name = PROVIDERS.iter().find(|(n, _, _)| n.to_lowercase() == value).map(|p| p.0).unwrap_or(&value);
+                                                    state.push_chat(ChatLine {
+                                                        kind: ChatLineKind::SystemInfo,
+                                                        content: format!("Provider set to {BOLD}{name}{RESET}"),
+                                                    });
+                                                    state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
+                                                }
+                                                Err(e) => {
+                                                    state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Failed: {e}") });
+                                                }
+                                            }
+                                            open_config_selector(&mut state, &format!("config:{scope}"), &config);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                state.render();
+                                continue 'prompt;
+                            }
+                            Key::Escape => {
+                                // Back-navigate: selectors with ':' in id have a parent
+                                if let Some(sel) = state.selector.take() {
+                                    if let Some((parent, _)) = sel.id.rsplit_once(':') {
+                                        open_config_selector(&mut state, parent, &config);
+                                    } else {
+                                        state.input_label.clear(); state.input_hint.clear();
+                                    }
+                                }
+                                state.render();
+                                continue 'prompt;
+                            }
+                            _ => { state.selector = None; state.input_label.clear(); state.input_hint.clear(); } // close and fall through
+                        }
+                    }
                     match key {
                         Key::Char(ch) => {
-                            state.input.buf.insert(state.input.cursor, ch);
-                            state.input.cursor += 1;
+                            state.input.insert(ch);
+                            last_ctrlc = 0;
+                        }
+                        Key::ShiftEnter => {
+                            state.input.insert('\n');
                             last_ctrlc = 0;
                         }
                         Key::Paste(text) => {
-                            for ch in text.chars() {
-                                state.input.buf.insert(state.input.cursor, ch);
-                                state.input.cursor += 1;
-                            }
+                            state.input.insert_str(&text);
                             last_ctrlc = 0;
                         }
                         Key::Enter => {
-                            let line: String = state.input.buf.drain(..).collect();
-                            state.input.cursor = 0;
+                            let line = state.input.drain_all();
                             let trimmed = line.trim().to_string();
                             if !trimmed.is_empty() {
                                 user_input = Some(trimmed);
@@ -623,35 +1181,92 @@ fn main() {
                             last_ctrlc = 0;
                         }
                         Key::Backspace => {
-                            if state.input.cursor > 0 {
-                                state.input.buf.remove(state.input.cursor - 1);
-                                state.input.cursor -= 1;
-                            }
+                            state.input.backspace();
                             last_ctrlc = 0;
                         }
                         Key::Delete => {
-                            if state.input.cursor < state.input.buf.len() {
-                                state.input.buf.remove(state.input.cursor);
+                            state.input.delete();
+                            last_ctrlc = 0;
+                        }
+                        Key::Left => { state.input.move_left(); last_ctrlc = 0; }
+                        Key::Right => { state.input.move_right(); last_ctrlc = 0; }
+                        Key::Up => {
+                            let inner = state.width.saturating_sub(2);
+                            if inner > 0 {
+                                let chars = state.input.to_chars();
+                                let lines = visual_line_breaks(&chars, inner);
+                                let cursor = state.input.before_cursor().len();
+                                let cur_line = lines.iter().position(|(s, e)| cursor >= *s && cursor < *e)
+                                    .unwrap_or(lines.len().saturating_sub(1));
+                                if cur_line > 0 {
+                                    // Use display width for column to handle CJK/emoji correctly
+                                    let col_width: usize = chars[lines[cur_line].0..cursor].iter()
+                                        .filter(|&&c| c != '\n').map(|&c| char_display_width(c)).sum();
+                                    let (ps, pe) = lines[cur_line - 1];
+                                    let end = if pe > ps && chars.get(pe - 1) == Some(&'\n') { pe - 1 } else { pe };
+                                    // Find char position on target line matching the display column
+                                    let mut w = 0;
+                                    let mut target = ps;
+                                    for i in ps..end {
+                                        if chars[i] == '\n' { continue; }
+                                        let cw = char_display_width(chars[i]);
+                                        if w + cw > col_width { break; }
+                                        w += cw;
+                                        target = i + 1;
+                                    }
+                                    state.input.set_cursor(target);
+                                } else {
+                                    state.input.move_home();
+                                }
                             }
                             last_ctrlc = 0;
                         }
-                        Key::Left => { if state.input.cursor > 0 { state.input.cursor -= 1; } last_ctrlc = 0; }
-                        Key::Right => { if state.input.cursor < state.input.buf.len() { state.input.cursor += 1; } last_ctrlc = 0; }
-                        Key::Home => { state.input.cursor = 0; last_ctrlc = 0; }
-                        Key::End => { state.input.cursor = state.input.buf.len(); last_ctrlc = 0; }
-                        Key::Tab => {
-                            let suggestion = slash_suggestion(&state.input.buf);
-                            if !suggestion.is_empty() {
-                                for ch in suggestion.chars() {
-                                    state.input.buf.push(ch);
+                        Key::Down => {
+                            let inner = state.width.saturating_sub(2);
+                            if inner > 0 {
+                                let chars = state.input.to_chars();
+                                let lines = visual_line_breaks(&chars, inner);
+                                let cursor = state.input.before_cursor().len();
+                                let cur_line = lines.iter().position(|(s, e)| cursor >= *s && cursor < *e)
+                                    .unwrap_or(lines.len().saturating_sub(1));
+                                if cur_line + 1 < lines.len() {
+                                    let col_width: usize = chars[lines[cur_line].0..cursor].iter()
+                                        .filter(|&&c| c != '\n').map(|&c| char_display_width(c)).sum();
+                                    let (ns, ne) = lines[cur_line + 1];
+                                    let end = if ne > ns && chars.get(ne - 1) == Some(&'\n') { ne - 1 } else { ne };
+                                    let mut w = 0;
+                                    let mut target = ns;
+                                    for i in ns..end {
+                                        if chars[i] == '\n' { continue; }
+                                        let cw = char_display_width(chars[i]);
+                                        if w + cw > col_width { break; }
+                                        w += cw;
+                                        target = i + 1;
+                                    }
+                                    state.input.set_cursor(target);
+                                } else {
+                                    state.input.move_end();
                                 }
-                                state.input.cursor = state.input.buf.len();
+                            }
+                            last_ctrlc = 0;
+                        }
+                        Key::Home => { state.input.move_home(); last_ctrlc = 0; }
+                        Key::End => { state.input.move_end(); last_ctrlc = 0; }
+                        Key::Tab => {
+                            let chars = state.input.to_chars();
+                            let suggestion = slash_suggestion(&chars);
+                            if !suggestion.is_empty() {
+                                state.input.move_end();
+                                state.input.insert_str(&suggestion);
                             }
                             last_ctrlc = 0;
                         }
                         Key::Escape => {
-                            state.input.buf.clear();
-                            state.input.cursor = 0;
+                            if let Some((scope, _)) = state.config_edit.take() {
+                                // Cancel config edit, return to options menu
+                                open_config_selector(&mut state, &format!("config:{scope}"), &config);
+                            }
+                            state.input.clear();
                         }
                         Key::CtrlC => {
                             let now = now_millis();
@@ -662,11 +1277,19 @@ fn main() {
                                 std::process::exit(0);
                             }
                             last_ctrlc = now;
-                            state.push_chat(ChatLine {
-                                kind: ChatLineKind::SystemInfo,
-                                content: "Press Ctrl+C again to exit".into(),
-                            });
+                            if !state.ctrlc_hint {
+                                state.push_chat(ChatLine {
+                                    kind: ChatLineKind::SystemInfo,
+                                    content: "Press Ctrl+C again to exit".into(),
+                                });
+                                state.ctrlc_hint = true;
+                            }
                         }
+                    }
+                    // Clear Ctrl+C hint when another key was pressed
+                    if last_ctrlc == 0 && state.ctrlc_hint {
+                        state.chat.pop();
+                        state.ctrlc_hint = false;
                     }
                     state.render();
                 }
@@ -675,7 +1298,23 @@ fn main() {
                     state.render();
                 }
                 Ok(Event::Tick) => {
-                    // No spinner during prompt, ignore
+                    // Boot animation
+                    if state.advance_cat_anim() {
+                        state.render();
+                    }
+                    // Continue fade-in animation after streaming ends
+                    if state.tick_fade() {
+                        state.render();
+                    }
+                    // Clear expired Ctrl+C hint
+                    if last_ctrlc > 0 && now_millis() - last_ctrlc >= 2000 {
+                        last_ctrlc = 0;
+                        if state.ctrlc_hint {
+                            state.chat.pop();
+                            state.ctrlc_hint = false;
+                            state.render();
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // Check if deadline passed (heartbeat)
@@ -688,20 +1327,55 @@ fn main() {
             }
         }
 
-        // Remove double-Ctrl+C hint if it was shown
-        if last_ctrlc > 0 {
-            if let Some(last) = state.chat.last() {
-                if matches!(last.kind, ChatLineKind::SystemInfo) && last.content.contains("Ctrl+C") {
-                    state.chat.pop();
-                }
-            }
+        // Remove Ctrl+C hint if it was shown
+        if state.ctrlc_hint {
+            state.chat.pop();
+            state.ctrlc_hint = false;
             last_ctrlc = 0;
         }
 
         // AGENT PHASE
         if let Some(text) = user_input {
+            // Config edit mode — save the entered value
+            if let Some((scope, field)) = state.config_edit.take() {
+                state.input_label.clear(); state.input_hint.clear();
+                // Sanitize single-line fields
+                let value = match field.as_str() {
+                    "name" => text.replace('\n', " ").trim().to_string(),
+                    "heartbeat" => text.trim().trim_end_matches('s').trim().to_string(),
+                    _ => text.clone(),
+                };
+                match save_config_field(&scope, &field, &value) {
+                    Ok(_) => {
+                        apply_config_change(&mut config, &field, &value);
+                        let label = CONFIG_FIELDS.iter().find(|f| f.0 == field).map(|f| f.1).unwrap_or(&field.as_str());
+                        state.push_chat(ChatLine {
+                            kind: ChatLineKind::SystemInfo,
+                            content: format!("{label} updated"),
+                        });
+                        if field == "name" || field == "system_prompt" || field == "heartbeat" {
+                            state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
+                        }
+                        if field == "system_prompt" {
+                            if let Some(msg) = messages.first_mut() {
+                                msg.content = build_system_prompt(&config, &*format, &registry, &cwd);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Failed: {e}") });
+                    }
+                }
+                open_config_selector(&mut state, &format!("config:{scope}"), &config);
+                state.render();
+                continue;
+            }
+
             // Handle slash commands
             if text.starts_with('/') {
+                state.push_chat(ChatLine { kind: ChatLineKind::UserMessage, content: text.clone() });
+                state.render();
+
                 let parts: Vec<&str> = text.splitn(2, ' ').collect();
                 let cmd = parts[0];
                 let args = parts.get(1).copied().unwrap_or("");
@@ -709,8 +1383,9 @@ fn main() {
                 match cmd {
                     "/help" => {
                         let mut help = String::new();
-                        let name_w = SLASH_COMMANDS.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-                        for (name, desc) in SLASH_COMMANDS {
+                        let cmds: Vec<_> = SLASH_COMMANDS.iter().filter(|(n, _)| *n != "/help").collect();
+                        let name_w = cmds.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+                        for (name, desc) in cmds {
                             help.push_str(&format!("  {CYAN}{name:<name_w$}{RESET}  {DIM}{desc}{RESET}\n"));
                         }
                         state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: help.trim_end().to_string() });
@@ -722,17 +1397,25 @@ fn main() {
                             if models.is_empty() {
                                 state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: format!("Model: {}", config.llm.model) });
                             } else {
-                                let mut out = String::new();
-                                for m in &models {
-                                    let active = m.key == config.llm.model;
-                                    let dot = if active { format!("{CYAN}●{RESET} ") } else { "  ".to_string() };
-                                    let name = if active { format!("{BOLD}{}{RESET}", m.display_name) } else { m.display_name.clone() };
+                                let items: Vec<SelectorItem> = models.iter().map(|m| {
                                     let ctx = m.ctx_display();
                                     let caps = m.caps_display();
-                                    let caps_str = if caps.is_empty() { String::new() } else { format!("  {caps}") };
-                                    out.push_str(&format!("  {dot}{name}  {DIM}{ctx} ctx{RESET}{caps_str}\n"));
+                                    let label = if caps.is_empty() {
+                                        format!("{} · {} ctx", m.display_name, ctx)
+                                    } else {
+                                        format!("{} · {} ctx · {}", m.display_name, ctx, caps)
+                                    };
+                                    SelectorItem { label, value: m.key.clone() }
+                                }).collect();
+                                let current_idx = models.iter().position(|m| m.key == config.llm.model).unwrap_or(0);
+                                let max_vis = 8.min(items.len());
+                                let mut sel = Selector::new("model", items, max_vis);
+                                sel.selected = current_idx;
+                                if sel.selected >= sel.max_visible {
+                                    sel.scroll_offset = sel.selected.saturating_sub(sel.max_visible / 2);
                                 }
-                                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: out.trim_end().to_string() });
+                                state.selector = Some(sel);
+                                state.input_label = "Model".into();
                             }
                         } else {
                             let new_model = args.trim().to_string();
@@ -754,27 +1437,50 @@ fn main() {
                                 }
                                 state.push_chat(ChatLine {
                                     kind: ChatLineKind::SystemInfo,
-                                    content: format!("Switched to {BOLD}{new_model}{RESET} ({fmt_str})"),
+                                    content: format!("Switched to {BOLD}{new_model}{RESET}"),
                                 });
-                                // Rebuild header with new model
+                                // Rebuild header + persist to config file
                                 state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
+                                if let Err(e) = save_model_to_config(&config_path, &new_model) {
+                                    state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Config save failed: {e}") });
+                                }
                             }
                         }
                     }
-                    "/tokens" => {
-                        let est = estimate_tokens(&messages);
+                    "/copy" => {
+                        let last_agent = state.chat.iter().rev()
+                            .find(|l| matches!(l.kind, ChatLineKind::AgentText));
+                        if let Some(line) = last_agent {
+                            match copy_to_clipboard(line.content.trim()) {
+                                Ok(()) => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: "Copied to clipboard".into() }),
+                                Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e }),
+                            }
+                        } else {
+                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: "No agent response to copy".into() });
+                        }
+                    }
+                    "/context" => {
                         state.push_chat(ChatLine {
                             kind: ChatLineKind::SystemInfo,
-                            content: format!("Context: ~{est} tokens ({} messages, compact at ~{}k)", messages.len(), config.agent.compact_at / 1000),
+                            content: format_context_display(&messages, &config),
                         });
                     }
                     "/compact" => {
                         let token_count = estimate_tokens(&messages);
-                        compact_context(&config.llm, &mut messages, token_count, &mut state);
-                        messages.push(Message { role: "user".into(), content: format!("[{}] Operator ran /compact", timestamp()) });
+                        if token_count < 1000 {
+                            state.push_chat(ChatLine {
+                                kind: ChatLineKind::SystemInfo,
+                                content: format!("Context too small to compact (~{token_count} tokens)"),
+                            });
+                        } else {
+                            compact_context(&config.llm, &mut messages, token_count, &mut state, &event_rx);
+                        }
+                    }
+                    "/config" => {
+                        open_config_selector(&mut state, "config", &config);
                     }
                     "/clear" => {
-                        let sys = messages.first().cloned().unwrap_or(Message { role: "system".into(), content: String::new() });
+                        let sys = messages.first().cloned().unwrap_or(Message { role: Role::System, content: String::new() });
                         messages.clear();
                         messages.push(sys);
                         state.chat.clear();
@@ -806,25 +1512,26 @@ fn main() {
 
             let token_count = api_tokens.unwrap_or_else(|| estimate_tokens(&messages));
             if token_count >= config.agent.compact_at {
-                compact_context(&config.llm, &mut messages, token_count, &mut state);
+                compact_context(&config.llm, &mut messages, token_count, &mut state, &event_rx);
             }
 
-            // Process queued messages from during agent execution
-            for q in queued {
-                // Upgrade from QueuedMessage to UserMessage in chat
-                if let Some(pos) = state.chat.iter().position(|l| matches!(l.kind, ChatLineKind::QueuedMessage) && l.content == q) {
-                    state.chat[pos].kind = ChatLineKind::UserMessage;
+            // Process queued messages — merge batch into one API call
+            while !queued.is_empty() {
+                let batch: Vec<String> = queued.drain(..).collect();
+                for q in &batch {
+                    if let Some(pos) = state.chat.iter().position(|l| matches!(l.kind, ChatLineKind::QueuedMessage) && l.content == *q) {
+                        state.chat[pos].kind = ChatLineKind::UserMessage;
+                    }
                 }
                 state.render();
-                let mut inner_queued = Vec::new();
-                let (qt, _nq) = run_heartbeat(
+                let (qt, new_queued) = run_heartbeat(
                     &config, &registry, &*format, &tools_json,
-                    &mut messages, vec![q], &mut state, &event_rx, &mut inner_queued,
+                    &mut messages, batch, &mut state, &event_rx, &mut queued,
                 );
-                // TODO: handle deeper queued messages if needed
+                queued.extend(new_queued);
                 let tc = qt.unwrap_or_else(|| estimate_tokens(&messages));
                 if tc >= config.agent.compact_at {
-                    compact_context(&config.llm, &mut messages, tc, &mut state);
+                    compact_context(&config.llm, &mut messages, tc, &mut state, &event_rx);
                 }
             }
         } else {
@@ -844,23 +1551,26 @@ fn main() {
 
             let token_count = api_tokens.unwrap_or_else(|| estimate_tokens(&messages));
             if token_count >= config.agent.compact_at {
-                compact_context(&config.llm, &mut messages, token_count, &mut state);
+                compact_context(&config.llm, &mut messages, token_count, &mut state, &event_rx);
             }
 
-            // Process queued messages
-            for q in queued {
-                if let Some(pos) = state.chat.iter().position(|l| matches!(l.kind, ChatLineKind::QueuedMessage) && l.content == q) {
-                    state.chat[pos].kind = ChatLineKind::UserMessage;
+            // Process queued messages — merge batch into one API call
+            while !queued.is_empty() {
+                let batch: Vec<String> = queued.drain(..).collect();
+                for q in &batch {
+                    if let Some(pos) = state.chat.iter().position(|l| matches!(l.kind, ChatLineKind::QueuedMessage) && l.content == *q) {
+                        state.chat[pos].kind = ChatLineKind::UserMessage;
+                    }
                 }
                 state.render();
-                let mut inner_queued = Vec::new();
-                let (qt, _) = run_heartbeat(
+                let (qt, new_queued) = run_heartbeat(
                     &config, &registry, &*format, &tools_json,
-                    &mut messages, vec![q], &mut state, &event_rx, &mut inner_queued,
+                    &mut messages, batch, &mut state, &event_rx, &mut queued,
                 );
+                queued.extend(new_queued);
                 let tc = qt.unwrap_or_else(|| estimate_tokens(&messages));
                 if tc >= config.agent.compact_at {
-                    compact_context(&config.llm, &mut messages, tc, &mut state);
+                    compact_context(&config.llm, &mut messages, tc, &mut state, &event_rx);
                 }
             }
         }
@@ -868,13 +1578,28 @@ fn main() {
 }
 
 fn timestamp() -> String {
-    Command::new("date").arg("+%H:%M").output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "???".into())
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Convert to local time using libc
+    let t = secs as libc::time_t;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    }
 }
 
 fn date_today() -> String {
-    Command::new("date").arg("+%Y-%m-%d").output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "???".into())
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let t = secs as libc::time_t;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+    }
 }

@@ -42,23 +42,15 @@ impl Tool for ReadTool {
     }
 
     fn display_action(&self, input: &str) -> String {
-        let path = input.trim();
-        let ext = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let is_image = IMAGE_EXTENSIONS.contains(&ext.as_str());
-        let truncated = super::truncate_middle(path, 50);
-        if is_image {
-            format!("Viewing {}", truncated)
-        } else {
-            format!("Reading {}", truncated)
-        }
+        super::truncate_middle(input.trim(), 60)
     }
 
     fn execute(&self, input: &str) -> String {
-        let path_str = input.trim().to_lowercase();
+        let raw_path = Path::new(input.trim());
+
+        // Resolve symlinks and canonicalize before checking blocklist
+        let resolved = raw_path.canonicalize().unwrap_or_else(|_| raw_path.to_path_buf());
+        let path_str = resolved.to_string_lossy().to_lowercase();
 
         // Block sensitive paths (same spirit as bash blocklist)
         const BLOCKED_PATHS: &[&str] = &[
@@ -72,7 +64,7 @@ impl Tool for ReadTool {
             }
         }
 
-        let path = Path::new(input.trim());
+        let path = &resolved;
 
         if !path.exists() {
             return format!("[error] File not found: {}", input);

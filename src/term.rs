@@ -19,16 +19,15 @@ pub const CURSOR_DEFAULT: &str = "\x1b[0 q";
 // Raw terminal mode
 // ---------------------------------------------------------------------------
 
-static ORIG_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
+pub static ORIG_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
 
 /// Restore terminal to its original state (safe to call from panic hooks)
 pub fn restore_terminal() {
     print!("{CURSOR_DEFAULT}\x1b[?2004l"); // restore cursor + disable bracketed paste
     let _ = io::stdout().flush();
-    if let Ok(guard) = ORIG_TERMIOS.lock() {
-        if let Some(ref orig) = *guard {
-            unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, orig); }
-        }
+    let guard = ORIG_TERMIOS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref orig) = *guard {
+        unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, orig); }
     }
 }
 
@@ -41,6 +40,7 @@ pub fn enable_raw_mode() -> libc::termios {
         }
         let mut raw = orig;
         raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+        raw.c_iflag &= !(libc::ICRNL); // don't translate CR→NL (lets us distinguish Enter from Shift+Enter)
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         libc::tcsetattr(0, libc::TCSAFLUSH, &raw);
@@ -110,8 +110,11 @@ pub enum Key {
     Delete,
     Left,
     Right,
+    Up,
+    Down,
     Home,
     End,
+    ShiftEnter,
     Tab,
     Escape,
     CtrlC,
@@ -120,8 +123,11 @@ pub enum Key {
 /// Read pasted content between bracketed paste markers (after \x1b[200~ has been consumed)
 fn read_paste() -> Key {
     let mut paste = String::new();
+    const MAX_PASTE: usize = 64 * 1024; // 64KB safety limit
 
     loop {
+        if paste.len() >= MAX_PASTE { break; }
+        if !stdin_ready(500) { break; } // 500ms timeout between bytes
         let b = match read_byte_raw() {
             Some(b) => b,
             None => break,
@@ -132,11 +138,14 @@ fn read_paste() -> Key {
             if stdin_ready(50) {
                 if let Some(b2) = read_byte_raw() {
                     if b2 == b'[' {
-                        // Read parameter + final byte
+                        // Read parameter + final byte (with timeout + length limit)
                         let mut seq = Vec::new();
-                        while let Some(sb) = read_byte_raw() {
-                            seq.push(sb);
-                            if sb >= b'@' { break; } // final byte of CSI
+                        while seq.len() < 16 {
+                            if !stdin_ready(100) { break; }
+                            if let Some(sb) = read_byte_raw() {
+                                seq.push(sb);
+                                if sb >= b'@' { break; } // final byte of CSI
+                            } else { break; }
                         }
                         if seq == b"201~" {
                             break; // end of paste
@@ -162,10 +171,11 @@ fn read_paste() -> Key {
             if let Ok(s) = std::str::from_utf8(&bytes) {
                 paste.push_str(s);
             }
+        } else if b == b'\r' || b == b'\n' {
+            paste.push('\n');
         } else if b >= 32 || b == b'\t' {
             paste.push(b as char);
         }
-        // Skip \r \n (newlines in pasted text)
     }
 
     Key::Paste(paste)
@@ -174,30 +184,41 @@ fn read_paste() -> Key {
 pub fn read_key() -> Option<Key> {
     let b = read_byte_raw()?;
     match b {
-        b'\r' | b'\n' => Some(Key::Enter),
+        b'\r' => Some(Key::Enter),
+        b'\n' => Some(Key::ShiftEnter), // Ctrl+J → insert newline
         b'\t' => Some(Key::Tab),
         127 | 8 => Some(Key::Backspace),
+        1 => Some(Key::Home),     // Ctrl+A
         3 => Some(Key::CtrlC),
+        5 => Some(Key::End),      // Ctrl+E
         b'\x1b' => {
             if !stdin_ready(50) { return Some(Key::Escape); }
             let b2 = read_byte_raw()?;
+            if b2 == b'\r' || b2 == b'\n' { return Some(Key::ShiftEnter); } // Alt+Enter → newline
             if b2 != b'[' { return Some(Key::Escape); }
 
             // Read CSI parameters (digits, semicolons) then final byte
             let mut params = Vec::new();
             loop {
+                if !stdin_ready(100) { return None; } // timeout: malformed sequence
                 let b3 = read_byte_raw()?;
                 if (b3 >= b'0' && b3 <= b'9') || b3 == b';' {
+                    if params.len() >= 16 { return None; } // sanity limit
                     params.push(b3);
                 } else {
                     // b3 is the final byte
                     let param: String = params.iter().map(|&c| c as char).collect();
                     return match (param.as_str(), b3) {
-                        ("", b'A') => Some(Key::Home),
-                        ("", b'B') => Some(Key::End),
+                        ("", b'A') => Some(Key::Up),
+                        ("", b'B') => Some(Key::Down),
                         ("", b'C') => Some(Key::Right),
                         ("", b'D') => Some(Key::Left),
+                        ("", b'H') => Some(Key::Home),
+                        ("", b'F') => Some(Key::End),
+                        ("1", b'~') => Some(Key::Home),
                         ("3", b'~') => Some(Key::Delete),
+                        ("4", b'~') => Some(Key::End),
+                        ("13;2", b'u') => Some(Key::ShiftEnter), // Shift+Enter (CSI u)
                         ("200", b'~') => Some(read_paste()),
                         _ => None,
                     };

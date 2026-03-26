@@ -20,6 +20,15 @@ pub trait Tool {
     fn display_action(&self, input: &str) -> String {
         format!("{}", input)
     }
+    /// Spawn as a background process for non-blocking execution with cancel support.
+    /// Returns None for tools that complete synchronously (default).
+    fn spawn(&self, _input: &str) -> Option<Result<std::process::Child, String>> { None }
+    /// Format the output of a completed child process.
+    fn format_output(&self, output: &std::process::Output) -> String {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+    /// Timeout for spawned processes (default 30s).
+    fn timeout(&self) -> std::time::Duration { std::time::Duration::from_secs(30) }
 }
 
 /// Truncate a string in the middle with "..." if it exceeds max_len (char-safe)

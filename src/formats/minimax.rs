@@ -126,10 +126,14 @@ fn parse_tool_call_block(block: &str) -> Option<ToolCall> {
     let tool_end = block[tool_start..].find('"')? + tool_start;
     let tool = block[tool_start..tool_end].to_string();
 
-    // Extract command from --command "..."
-    let cmd_start = block.find("--command \"")? + "--command \"".len();
-    let cmd_end = block[cmd_start..].find('"')? + cmd_start;
-    let input = block[cmd_start..cmd_end].to_string();
+    // Extract command — find opening quote after --command, then match the LAST quote
+    // before the closing brace to handle embedded quotes in the command
+    let cmd_marker = "--command \"";
+    let cmd_start = block.find(cmd_marker)? + cmd_marker.len();
+    let rest = &block[cmd_start..];
+    // Find last `"` in the remaining block (handles embedded quotes)
+    let cmd_end = rest.rfind('"').unwrap_or(rest.len());
+    let input = rest[..cmd_end].to_string();
 
     Some(ToolCall { tool, input })
 }

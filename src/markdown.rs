@@ -10,15 +10,20 @@ pub struct MarkdownRenderer {
     pending_star: bool,
     pending_newlines: usize,
     last_printed: char,
+    base_style: &'static str,
 }
 
 impl MarkdownRenderer {
     pub fn new() -> Self {
-        Self { bold: false, italic: false, pending_star: false, pending_newlines: 0, last_printed: ' ' }
+        Self { bold: false, italic: false, pending_star: false, pending_newlines: 0, last_printed: ' ', base_style: "" }
+    }
+
+    pub fn with_base_style(style: &'static str) -> Self {
+        Self { base_style: style, ..Self::new() }
     }
 
     fn apply_style(&self, out: &mut String) {
-        let _ = write!(out, "{RESET}");
+        let _ = write!(out, "{RESET}{}", self.base_style);
         if self.bold { let _ = write!(out, "{BOLD}"); }
         if self.italic { let _ = write!(out, "{ITALIC}"); }
     }
@@ -42,9 +47,9 @@ impl MarkdownRenderer {
 
     fn is_italic_marker(&self, next_ch: char) -> bool {
         if self.italic {
-            self.last_printed.is_alphanumeric()
+            !self.last_printed.is_whitespace() // closing: any non-whitespace before *
         } else {
-            next_ch.is_alphanumeric()
+            next_ch.is_alphanumeric()          // opening: alphanumeric after * (glob-safe)
         }
     }
 
@@ -74,9 +79,35 @@ impl MarkdownRenderer {
     pub fn flush(&mut self, out: &mut String) {
         if self.pending_star {
             self.pending_star = false;
-            out.push('*');
+            if self.italic {
+                self.italic = false;
+                self.apply_style(out);
+            } else if self.bold {
+                self.bold = false;
+                self.apply_style(out);
+            } else {
+                out.push('*');
+            }
         }
         self.pending_newlines = 0;
+        let _ = write!(out, "{RESET}");
+    }
+
+    /// Flush preserving trailing newlines (for streaming — so line breaks appear immediately)
+    pub fn flush_streaming(&mut self, out: &mut String) {
+        if self.pending_star {
+            self.pending_star = false;
+            if self.italic {
+                self.italic = false;
+                self.apply_style(out);
+            } else if self.bold {
+                self.bold = false;
+                self.apply_style(out);
+            } else {
+                out.push('*');
+            }
+        }
+        self.emit_newlines(out); // keep trailing newlines
         let _ = write!(out, "{RESET}");
     }
 }
