@@ -27,9 +27,9 @@ impl Tool for ReadTool {
 
     fn description(&self) -> &str {
         if self.vision_enabled {
-            "Read a text file or view an image. Supports text files (txt, json, log, csv, toml, rs, py, etc.) and images (png, jpg, gif, webp)."
+            "Read a text file or view an image. Output includes line numbers. Optionally specify a line range to save context: /path/to/file:10-50 (lines 10 to 50 inclusive). Supports text files and images (png, jpg, gif, webp)."
         } else {
-            "Read a text file. Supports txt, json, log, csv, toml, rs, py, and other text formats."
+            "Read a text file with line numbers. Optionally specify a line range: /path/to/file:10-50 (lines 10 to 50 inclusive)."
         }
     }
 
@@ -38,7 +38,7 @@ impl Tool for ReadTool {
     }
 
     fn usage_hint(&self) -> &str {
-        "/path/to/file"
+        "/path/to/file or /path/to/file:10-50"
     }
 
     fn display_action(&self, input: &str) -> String {
@@ -46,7 +46,25 @@ impl Tool for ReadTool {
     }
 
     fn execute(&self, input: &str) -> String {
-        let raw_path = Path::new(input.trim());
+        // Parse optional line range: /path/to/file:10-50
+        let trimmed = input.trim();
+        let (path_str, line_range) = if let Some(colon) = trimmed.rfind(':') {
+            let after = &trimmed[colon + 1..];
+            if let Some(dash) = after.find('-') {
+                let start = after[..dash].parse::<usize>().ok();
+                let end = after[dash + 1..].parse::<usize>().ok();
+                if let (Some(s), Some(e)) = (start, end) {
+                    (&trimmed[..colon], Some((s, e)))
+                } else {
+                    (trimmed, None)
+                }
+            } else {
+                (trimmed, None)
+            }
+        } else {
+            (trimmed, None)
+        };
+        let raw_path = Path::new(path_str);
 
         // Resolve symlinks and canonicalize before checking blocklist
         let resolved = raw_path.canonicalize().unwrap_or_else(|_| raw_path.to_path_buf());
@@ -114,24 +132,47 @@ impl Tool for ReadTool {
             return format!("{}data:{};base64,{}]", IMAGE_MARKER, mime, b64);
         }
 
-        // Text file
+        // Text file — output with line numbers
         match fs::read_to_string(path) {
             Ok(content) => {
-                if content.len() > MAX_TEXT_SIZE {
-                    // Find a safe char boundary at or before MAX_TEXT_SIZE
-                    let mut end = MAX_TEXT_SIZE;
-                    while end > 0 && !content.is_char_boundary(end) {
-                        end -= 1;
+                let all_lines: Vec<&str> = content.lines().collect();
+                let total_lines = all_lines.len();
+
+                // Apply line range filter
+                let (lines, range_start) = if let Some((start, end)) = line_range {
+                    let s = start.max(1) - 1; // 1-indexed → 0-indexed
+                    let e = end.min(total_lines);
+                    if s >= total_lines {
+                        return format!("[error] Line {start} is past end of file ({total_lines} lines)");
                     }
-                    format!(
-                        "{}\n[truncated at {} bytes, file is {} bytes total]",
-                        &content[..end],
-                        end,
-                        content.len()
-                    )
+                    (all_lines[s..e].to_vec(), s)
                 } else {
-                    content
+                    // No range: apply size limit
+                    let truncated = if content.len() > MAX_TEXT_SIZE {
+                        let mut end = MAX_TEXT_SIZE;
+                        while end > 0 && !content.is_char_boundary(end) { end -= 1; }
+                        &content[..end]
+                    } else {
+                        &content
+                    };
+                    (truncated.lines().collect(), 0)
+                };
+
+                let max_line_num = range_start + lines.len();
+                let width = max_line_num.to_string().len();
+                let mut out = String::with_capacity(lines.len() * 80);
+                for (i, line) in lines.iter().enumerate() {
+                    let num = range_start + i + 1;
+                    out.push_str(&format!("{num:>width$}│{line}\n"));
                 }
+
+                if line_range.is_none() && content.len() > MAX_TEXT_SIZE {
+                    out.push_str(&format!("[truncated at {} bytes, file is {} bytes total]", MAX_TEXT_SIZE, content.len()));
+                }
+                if line_range.is_some() {
+                    out.push_str(&format!("[lines {}-{} of {total_lines}]", range_start + 1, range_start + lines.len()));
+                }
+                out
             }
             Err(_) => "[error] File is not valid UTF-8 text (binary file?)".into(),
         }

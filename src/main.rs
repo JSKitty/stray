@@ -144,6 +144,9 @@ fn call_llm(
     let mut received_done = false;
     let mut tag_buf = String::new();
     let mut inside_tool_tag = false;
+    let mut tool_tag_name = String::new();
+    let mut tool_preview = String::new();
+    let mut tool_preview_shown = false;
 
     let mut tc_names: Vec<String> = Vec::new();
     let mut tc_args: Vec<String> = Vec::new();
@@ -258,10 +261,35 @@ fn call_llm(
                     for ch in text.chars() {
                         if inside_tool_tag {
                             tag_buf.push(ch);
+                            // Update live tool preview (show first line = file path)
+                            if ch != '<' {
+                                tool_preview.push(ch);
+                                let first_line = tool_preview.lines().next().unwrap_or("").trim();
+                                if !first_line.is_empty() {
+                                    let mut title_chars = tool_tag_name.chars();
+                                    let title = match title_chars.next() {
+                                        Some(c) => format!("{}{}", c.to_uppercase(), title_chars.as_str()),
+                                        None => tool_tag_name.clone(),
+                                    };
+                                    if !tool_preview_shown {
+                                        // First detection: switch from streaming to spinner
+                                        if streaming_started {
+                                            s.end_streaming();
+                                        }
+                                        s.start_spinner(&format!("{title} → {first_line}"));
+                                        tool_preview_shown = true;
+                                    } else {
+                                        // Update spinner label as more content arrives
+                                        s.spinner.label = format!("{title} → {first_line}");
+                                    }
+                                }
+                            }
                             for tag in tool_tags {
                                 if tag_buf.ends_with(&format!("</{tag}>")) {
                                     inside_tool_tag = false;
                                     tag_buf.clear();
+                                    tool_preview.clear();
+                                    tool_preview_shown = false;
                                     break;
                                 }
                             }
@@ -269,15 +297,18 @@ fn call_llm(
                         }
                         if ch == '<' || !tag_buf.is_empty() {
                             tag_buf.push(ch);
-                            // Safety: flush oversized tag buffers as literal text
                             if tag_buf.len() > 128 && !inside_tool_tag {
                                 display_text.push_str(&tag_buf);
                                 tag_buf.clear();
                                 continue;
                             }
                             if ch == '>' {
-                                if tool_tags.iter().any(|t| tag_buf == format!("<{t}>")) {
+                                if let Some(tag) = tool_tags.iter().find(|t| tag_buf == format!("<{t}>")) {
                                     inside_tool_tag = true;
+                                    tool_tag_name = tag.to_string();
+                                    tool_preview.clear();
+                                    tool_preview_shown = false;
+                                    tag_buf.clear();
                                     continue;
                                 }
                                 display_text.push_str(&tag_buf);
@@ -1063,6 +1094,8 @@ fn main() {
         let mut r = ToolRegistry::new();
         r.add(Box::new(tools::BashTool));
         r.add(Box::new(tools::ReadTool::new(config.llm.vision)));
+        r.add(Box::new(tools::WriteTool));
+        r.add(Box::new(tools::EditTool));
         r
     };
 

@@ -1,8 +1,12 @@
 mod bash;
+mod edit;
 pub mod read;
+mod write;
 
 pub use bash::BashTool;
+pub use edit::EditTool;
 pub use read::ReadTool;
+pub use write::WriteTool;
 
 /// A tool the agent can invoke via XML tags in its output.
 pub trait Tool {
