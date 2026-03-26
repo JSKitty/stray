@@ -353,6 +353,7 @@ pub struct AppState {
     pub input_hint: String,                      // description shown below border
     pub ctrlc_hint: bool,                        // whether the Ctrl+C exit hint is showing
     pub fade_chars: Vec<u8>,                      // per-char fade countdown (0 = white)
+    pub scroll_offset: usize,                    // rows scrolled up from bottom (0 = at bottom)
     pub cat_anim: CatAnim,                       // unified cat animation state
     pub tagline: &'static str,                   // random boot tagline
     pub last_render: Instant,
@@ -380,6 +381,7 @@ impl AppState {
             input_hint: String::new(),
             ctrlc_hint: false,
             fade_chars: Vec::new(),
+            scroll_offset: 0,
             cat_anim: CatAnim::new(),
             tagline: TAGLINES[std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
@@ -403,6 +405,7 @@ impl AppState {
 
     pub fn push_chat(&mut self, line: ChatLine) {
         self.chat.push(line);
+        self.scroll_offset = 0; // snap to bottom on new content
     }
 
     pub fn begin_streaming(&mut self) {
@@ -422,6 +425,7 @@ impl AppState {
                     self.fade_chars.push(FADE_SHADES.len() as u8);
                 }
                 self.cache_dirty = true;
+                self.scroll_offset = 0; // snap to bottom
                 break;
             }
         }
@@ -623,13 +627,27 @@ impl AppState {
         };
         let total_rows = self.cached_rows.len() + if spinner_row.is_some() { 1 } else { 0 };
 
-        // Auto-scroll: show last chat_h rows
-        let start = total_rows.saturating_sub(chat_h);
+        // Scrollback: clamp offset and compute visible window
+        let max_scroll = total_rows.saturating_sub(chat_h);
+        if self.scroll_offset > max_scroll { self.scroll_offset = max_scroll; }
+        let end = total_rows.saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(chat_h);
+
+        // Scroll indicator (first row shows ▲ N more when scrolled up)
+        let show_scroll_hint = self.scroll_offset > 0 && chat_h > 1;
+        let effective_chat_h = if show_scroll_hint { chat_h - 1 } else { chat_h };
+
+        if show_scroll_hint {
+            let hidden_below = self.scroll_offset;
+            let hint = format!("{DIM}  ▼ {hidden_below} more below{RESET}");
+            write_padded_line(buf, &hint, w);
+        }
 
         // Render visible rows from cache + optional spinner
         let mut rendered = 0;
-        for i in start..total_rows {
-            if rendered >= chat_h { break; }
+        let render_start = if show_scroll_hint { end.saturating_sub(effective_chat_h) } else { start };
+        for i in render_start..end {
+            if rendered >= effective_chat_h { break; }
             if i < self.cached_rows.len() {
                 write_padded_line(buf, &self.cached_rows[i], w);
             } else if let Some(ref sr) = spinner_row {
@@ -638,7 +656,8 @@ impl AppState {
             rendered += 1;
         }
         // Blank-fill remaining
-        for _ in rendered..chat_h {
+        let fill_target = if show_scroll_hint { effective_chat_h } else { chat_h };
+        for _ in rendered..fill_target {
             write_padded_line(buf, "", w);
         }
 
@@ -979,12 +998,18 @@ fn wrap_styled_with_prefix(first_prefix: &str, cont_prefix: &str, styled: &str, 
     let inner = width.saturating_sub(fp_vis);
     if inner == 0 { return vec![format!("{first_prefix}{styled}")]; }
 
-    // Simple approach: split by visible character count, preserving ANSI sequences
+    // Word-boundary wrapping: break at last space before width limit.
+    // Falls back to character wrapping for long words with no spaces.
     let mut rows: Vec<String> = Vec::new();
     let mut current_row = String::new();
     let mut vis_count = 0;
     let mut in_escape = false;
-    let max = inner; // first line width
+    let max = inner;
+
+    // Track the last word boundary for potential wrap point
+    let mut last_space_row_len = 0usize; // byte position in current_row after the space
+    let mut last_space_vis = 0usize;     // vis_count after the space
+    let mut has_space = false;
 
     for ch in styled.chars() {
         if in_escape {
@@ -1001,16 +1026,33 @@ fn wrap_styled_with_prefix(first_prefix: &str, cont_prefix: &str, styled: &str, 
             rows.push(current_row);
             current_row = String::new();
             vis_count = 0;
+            has_space = false;
             continue;
         }
         let cw = char_display_width(ch);
         if vis_count + cw > max {
-            rows.push(current_row);
-            current_row = String::new();
-            vis_count = 0;
+            if has_space && last_space_vis > 0 {
+                // Break at the last word boundary
+                let overflow = current_row[last_space_row_len..].to_string();
+                current_row.truncate(last_space_row_len);
+                rows.push(current_row);
+                current_row = overflow;
+                vis_count = vis_count - last_space_vis;
+            } else {
+                // No space found — character wrap (long word)
+                rows.push(current_row);
+                current_row = String::new();
+                vis_count = 0;
+            }
+            has_space = false;
         }
         current_row.push(ch);
         vis_count += cw;
+        if ch == ' ' {
+            last_space_row_len = current_row.len();
+            last_space_vis = vis_count;
+            has_space = true;
+        }
     }
     if !current_row.is_empty() || rows.is_empty() {
         rows.push(current_row);

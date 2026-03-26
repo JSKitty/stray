@@ -1190,64 +1190,92 @@ fn main() {
                         }
                         Key::Left => { state.input.move_left(); last_ctrlc = 0; }
                         Key::Right => { state.input.move_right(); last_ctrlc = 0; }
-                        Key::Up => {
-                            let inner = state.width.saturating_sub(2);
-                            if inner > 0 {
-                                let chars = state.input.to_chars();
-                                let lines = visual_line_breaks(&chars, inner);
-                                let cursor = state.input.before_cursor().len();
-                                let cur_line = lines.iter().position(|(s, e)| cursor >= *s && cursor < *e)
-                                    .unwrap_or(lines.len().saturating_sub(1));
-                                if cur_line > 0 {
-                                    // Use display width for column to handle CJK/emoji correctly
-                                    let col_width: usize = chars[lines[cur_line].0..cursor].iter()
-                                        .filter(|&&c| c != '\n').map(|&c| char_display_width(c)).sum();
-                                    let (ps, pe) = lines[cur_line - 1];
-                                    let end = if pe > ps && chars.get(pe - 1) == Some(&'\n') { pe - 1 } else { pe };
-                                    // Find char position on target line matching the display column
-                                    let mut w = 0;
-                                    let mut target = ps;
-                                    for i in ps..end {
-                                        if chars[i] == '\n' { continue; }
-                                        let cw = char_display_width(chars[i]);
-                                        if w + cw > col_width { break; }
-                                        w += cw;
-                                        target = i + 1;
+                        Key::Up | Key::ShiftUp => {
+                            let is_shift = matches!(key, Key::ShiftUp);
+                            let mut scrolled = false;
+                            if is_shift {
+                                state.scroll_offset += 1;
+                                scrolled = true;
+                            } else {
+                                let inner = state.width.saturating_sub(2);
+                                if inner > 0 {
+                                    let chars = state.input.to_chars();
+                                    let lines = visual_line_breaks(&chars, inner);
+                                    let cursor = state.input.before_cursor().len();
+                                    let cur_line = lines.iter().position(|(s, e)| cursor >= *s && cursor < *e)
+                                        .unwrap_or(lines.len().saturating_sub(1));
+                                    if cur_line > 0 {
+                                        let col_width: usize = chars[lines[cur_line].0..cursor].iter()
+                                            .filter(|&&c| c != '\n').map(|&c| char_display_width(c)).sum();
+                                        let (ps, pe) = lines[cur_line - 1];
+                                        let end = if pe > ps && chars.get(pe - 1) == Some(&'\n') { pe - 1 } else { pe };
+                                        let mut w = 0;
+                                        let mut target = ps;
+                                        for i in ps..end {
+                                            if chars[i] == '\n' { continue; }
+                                            let cw = char_display_width(chars[i]);
+                                            if w + cw > col_width { break; }
+                                            w += cw;
+                                            target = i + 1;
+                                        }
+                                        state.input.set_cursor(target);
+                                    } else if state.input.before_cursor().is_empty() {
+                                        // Already at very start — scroll up
+                                        state.scroll_offset += 1;
+                                        scrolled = true;
+                                    } else {
+                                        state.input.move_home();
                                     }
-                                    state.input.set_cursor(target);
-                                } else {
-                                    state.input.move_home();
+                                }
+                            }
+                            let _ = scrolled; // scroll_offset clamped in render
+                            last_ctrlc = 0;
+                        }
+                        Key::Down | Key::ShiftDown => {
+                            let is_shift = matches!(key, Key::ShiftDown);
+                            if is_shift {
+                                state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                            } else {
+                                let inner = state.width.saturating_sub(2);
+                                if inner > 0 {
+                                    let chars = state.input.to_chars();
+                                    let lines = visual_line_breaks(&chars, inner);
+                                    let cursor = state.input.before_cursor().len();
+                                    let cur_line = lines.iter().position(|(s, e)| cursor >= *s && cursor < *e)
+                                        .unwrap_or(lines.len().saturating_sub(1));
+                                    if cur_line + 1 < lines.len() {
+                                        let col_width: usize = chars[lines[cur_line].0..cursor].iter()
+                                            .filter(|&&c| c != '\n').map(|&c| char_display_width(c)).sum();
+                                        let (ns, ne) = lines[cur_line + 1];
+                                        let end = if ne > ns && chars.get(ne - 1) == Some(&'\n') { ne - 1 } else { ne };
+                                        let mut w = 0;
+                                        let mut target = ns;
+                                        for i in ns..end {
+                                            if chars[i] == '\n' { continue; }
+                                            let cw = char_display_width(chars[i]);
+                                            if w + cw > col_width { break; }
+                                            w += cw;
+                                            target = i + 1;
+                                        }
+                                        state.input.set_cursor(target);
+                                    } else if state.scroll_offset > 0 {
+                                        // Already at bottom of input — scroll down
+                                        state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                                    } else {
+                                        state.input.move_end();
+                                    }
                                 }
                             }
                             last_ctrlc = 0;
                         }
-                        Key::Down => {
-                            let inner = state.width.saturating_sub(2);
-                            if inner > 0 {
-                                let chars = state.input.to_chars();
-                                let lines = visual_line_breaks(&chars, inner);
-                                let cursor = state.input.before_cursor().len();
-                                let cur_line = lines.iter().position(|(s, e)| cursor >= *s && cursor < *e)
-                                    .unwrap_or(lines.len().saturating_sub(1));
-                                if cur_line + 1 < lines.len() {
-                                    let col_width: usize = chars[lines[cur_line].0..cursor].iter()
-                                        .filter(|&&c| c != '\n').map(|&c| char_display_width(c)).sum();
-                                    let (ns, ne) = lines[cur_line + 1];
-                                    let end = if ne > ns && chars.get(ne - 1) == Some(&'\n') { ne - 1 } else { ne };
-                                    let mut w = 0;
-                                    let mut target = ns;
-                                    for i in ns..end {
-                                        if chars[i] == '\n' { continue; }
-                                        let cw = char_display_width(chars[i]);
-                                        if w + cw > col_width { break; }
-                                        w += cw;
-                                        target = i + 1;
-                                    }
-                                    state.input.set_cursor(target);
-                                } else {
-                                    state.input.move_end();
-                                }
-                            }
+                        Key::PageUp => {
+                            let chat_h = state.height.saturating_sub(state.header_lines.len() + 3);
+                            state.scroll_offset += chat_h.max(1);
+                            last_ctrlc = 0;
+                        }
+                        Key::PageDown => {
+                            let chat_h = state.height.saturating_sub(state.header_lines.len() + 3);
+                            state.scroll_offset = state.scroll_offset.saturating_sub(chat_h.max(1));
                             last_ctrlc = 0;
                         }
                         Key::Home => { state.input.move_home(); last_ctrlc = 0; }
