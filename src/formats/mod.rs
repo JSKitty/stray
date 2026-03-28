@@ -25,6 +25,10 @@ pub trait ModelFormat {
 
     /// Format tool results back into a message for the LLM
     fn format_results(&self, results: &[(String, String, String)]) -> String;
+
+    /// Extra XML tags to filter from streaming display (format-specific wrappers).
+    /// Default: none. MiniMax overrides to add its wrapper tags.
+    fn display_filter_tags(&self) -> Vec<&'static str> { Vec::new() }
 }
 
 /// Select the right format based on model ID

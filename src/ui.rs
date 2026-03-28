@@ -149,6 +149,9 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/compact", "Force context compaction"),
     ("/copy", "Copy last response to clipboard"),
     ("/config", "Edit configuration"),
+    ("/roles", "Manage agent roles"),
+    ("/departments", "View department statuses"),
+    ("/department", "Create a new department"),
     ("/clear", "Clear conversation history"),
     ("/exit", "Exit stray"),
 ];

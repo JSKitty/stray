@@ -51,14 +51,12 @@ impl ModelFormat for MiniMaxFormat {
         let alt_open = "[TOOL_CALL]";
         let alt_close = "[/TOOL_CALL]";
 
-        // Parse <minimax:tool_call> blocks
+        // Parse <minimax:tool_call> blocks (may contain multiple <invoke> elements)
         while let Some(start) = response[search_from..].find(block_open) {
             let abs_start = search_from + start + block_open.len();
             if let Some(end) = response[abs_start..].find(block_close) {
                 let block = &response[abs_start..abs_start + end];
-                if let Some(call) = parse_invoke_block(block) {
-                    calls.push(call);
-                }
+                calls.extend(parse_invoke_block(block));
                 search_from = abs_start + end + block_close.len();
             } else {
                 break;
@@ -103,20 +101,47 @@ impl ModelFormat for MiniMaxFormat {
         }
         s
     }
+
+    fn display_filter_tags(&self) -> Vec<&'static str> {
+        vec!["minimax:tool_call"]
+    }
 }
 
-/// Parse <invoke name="tool"><parameter name="command">...</parameter></invoke>
-fn parse_invoke_block(block: &str) -> Option<ToolCall> {
-    let name_start = block.find("<invoke name=\"")? + "<invoke name=\"".len();
-    let name_end = block[name_start..].find('"')? + name_start;
-    let tool = block[name_start..name_end].to_string();
+/// Parse all <invoke name="tool"><parameter name="command">...</parameter></invoke> blocks
+fn parse_invoke_block(block: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut search_from = 0;
+    let invoke_open = "<invoke name=\"";
+    let invoke_close = "</invoke>";
 
-    let param_tag = "<parameter name=\"command\">";
-    let param_start = block.find(param_tag)? + param_tag.len();
-    let param_end = block[param_start..].find("</parameter>")? + param_start;
-    let input = block[param_start..param_end].trim().to_string();
+    while let Some(start) = block[search_from..].find(invoke_open) {
+        let abs_start = search_from + start + invoke_open.len();
+        if let Some(name_end) = block[abs_start..].find('"') {
+            let tool = block[abs_start..abs_start + name_end].to_string();
 
-    Some(ToolCall { tool, input })
+            // Find the closing </invoke> for this invocation
+            let invoke_body_start = abs_start + name_end;
+            if let Some(close) = block[invoke_body_start..].find(invoke_close) {
+                let invoke_body = &block[invoke_body_start..invoke_body_start + close];
+
+                let param_tag = "<parameter name=\"command\">";
+                if let Some(ps) = invoke_body.find(param_tag) {
+                    let ps = ps + param_tag.len();
+                    if let Some(pe) = invoke_body[ps..].find("</parameter>") {
+                        let input = invoke_body[ps..ps + pe].trim().to_string();
+                        calls.push(ToolCall { tool, input });
+                    }
+                }
+                search_from = invoke_body_start + close + invoke_close.len();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    calls
 }
 
 /// Parse {tool => "name", args => {--command "..."}} format

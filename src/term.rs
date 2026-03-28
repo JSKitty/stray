@@ -119,6 +119,8 @@ pub enum Key {
     PageDown,
     ShiftUp,
     ShiftDown,
+    AltUp,
+    AltDown,
     Tab,
     Escape,
     CtrlC,
@@ -226,6 +228,10 @@ pub fn read_key() -> Option<Key> {
                         ("6", b'~') => Some(Key::PageDown),
                         ("1;2", b'A') => Some(Key::ShiftUp),
                         ("1;2", b'B') => Some(Key::ShiftDown),
+                        ("1;3", b'A') => Some(Key::AltUp),    // Alt/Option+Up
+                        ("1;3", b'B') => Some(Key::AltDown),  // Alt/Option+Down
+                        ("1;5", b'A') => Some(Key::AltUp),    // Ctrl+Up (same action)
+                        ("1;5", b'B') => Some(Key::AltDown),  // Ctrl+Down (same action)
                         ("13;2", b'u') => Some(Key::ShiftEnter), // Shift+Enter (CSI u)
                         ("200", b'~') => Some(read_paste()),
                         _ => None,

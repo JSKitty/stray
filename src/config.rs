@@ -154,7 +154,7 @@ pub struct AgentConfig {
     pub compact_at: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct LlmConfig {
     pub api_url: String,
     pub api_key: String,

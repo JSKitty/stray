@@ -1,8 +1,11 @@
 mod config;
+mod departments;
 mod event;
 mod formats;
 mod highlight;
 mod markdown;
+mod roles;
+mod sandbox;
 mod term;
 mod tools;
 mod ui;
@@ -20,28 +23,28 @@ use tools::ToolRegistry;
 use ui::*;
 
 const MAX_TOOL_ROUNDS: usize = 25;
-const CHARS_PER_TOKEN: usize = 4;
+pub(crate) const CHARS_PER_TOKEN: usize = 4;
 
 // ---------------------------------------------------------------------------
 // LLM client
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum Role { System, User, Assistant }
+pub(crate) enum Role { System, User, Assistant }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self { Role::System => "system", Role::User => "user", Role::Assistant => "assistant" }
     }
 }
 
 #[derive(Clone)]
-struct Message {
-    role: Role,
-    content: String,
+pub(crate) struct Message {
+    pub(crate) role: Role,
+    pub(crate) content: String,
 }
 
-fn message_to_json(msg: &Message, vision: bool) -> serde_json::Value {
+pub(crate) fn message_to_json(msg: &Message, vision: bool) -> serde_json::Value {
     if vision && msg.content.contains(IMAGE_MARKER) {
         let mut parts: Vec<serde_json::Value> = Vec::new();
         let mut remaining = msg.content.as_str();
@@ -71,14 +74,14 @@ fn message_to_json(msg: &Message, vision: bool) -> serde_json::Value {
     }
 }
 
-struct LlmResponse {
-    content: String,
-    total_tokens: Option<usize>,
-    disturbed: bool,
+pub(crate) struct LlmResponse {
+    pub(crate) content: String,
+    pub(crate) total_tokens: Option<usize>,
+    pub(crate) disturbed: bool,
 }
 
 /// Call the LLM with SSE streaming. Updates AppState for display if provided.
-fn call_llm(
+pub(crate) fn call_llm(
     config: &LlmConfig,
     messages: &[Message],
     tools_json: &Option<serde_json::Value>,
@@ -172,43 +175,18 @@ fn call_llm(
                             if s.spinner.active {
                                 s.spinner.frame = (s.spinner.frame + 1) % 10;
                             }
+                            // Poll department completions — notifications go to message queue
+                            let dept_notifs = poll_department_completions(s);
+                            for n in dept_notifs {
+                                queued_messages.push(n);
+                            }
                             s.render();
                         }
                     }
-                    // Handle input during agent execution (queue messages)
+                    // Handle input during agent execution (queue messages + selector nav)
                     Event::Key(key) => {
                         if let Some(ref mut s) = state {
-                            match key {
-                                Key::Char(ch) => { s.input.insert(ch); }
-                                Key::ShiftEnter => { s.input.insert('\n'); }
-                                Key::Paste(text) => { s.input.insert_str(&text); }
-                                Key::Backspace => { s.input.backspace(); }
-                                Key::Delete => { s.input.delete(); }
-                                Key::Left => { s.input.move_left(); }
-                                Key::Right => { s.input.move_right(); }
-                                Key::Home => { s.input.move_home(); }
-                                Key::End => { s.input.move_end(); }
-                                Key::Enter => {
-                                    let line = s.input.drain_all();
-                                    let trimmed = line.trim().to_string();
-                                    if !trimmed.is_empty() {
-                                        if trimmed.starts_with('/') {
-                                            handle_inline_slash(&trimmed, s, messages);
-                                        } else {
-                                            queued_messages.push(trimmed.clone());
-                                            s.push_chat(ChatLine { kind: ChatLineKind::QueuedMessage, content: trimmed });
-                                        }
-                                    }
-                                }
-                                Key::Tab => {
-                                    let chars = s.input.to_chars();
-                                    let suggestion = slash_suggestion(&chars);
-                                    s.input.move_end();
-                                    s.input.insert_str(&suggestion);
-                                }
-                                _ => {}
-                            }
-                            s.render();
+                            handle_agent_key(key, s, messages, queued_messages);
                         }
                     }
                 }
@@ -414,7 +392,7 @@ fn call_llm(
 
 const TOKENS_PER_IMAGE: usize = 1000;
 
-fn estimate_tokens(messages: &[Message]) -> usize {
+pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
     messages.iter().map(|m| {
         let content = &m.content;
         let mut tokens = 4;
@@ -435,7 +413,7 @@ fn estimate_tokens(messages: &[Message]) -> usize {
     }).sum()
 }
 
-const COMPACT_PROMPT: &str = "\
+pub(crate) const COMPACT_PROMPT: &str = "\
 You are being asked to compact your conversation context. The conversation so far \
 will be replaced by your summary. Preserve EVERYTHING important:\n\
 1. **State**: What is the current state of your tasks, wallet, environment?\n\
@@ -468,6 +446,15 @@ fn compact_context(
             return;
         }
     };
+
+    // Abort if disturbed or empty response (e.g. network error)
+    if resp.disturbed || resp.content.trim().is_empty() {
+        messages.pop(); // remove the compact prompt
+        state.stop_spinner();
+        state.push_chat(ChatLine { kind: ChatLineKind::Error, content: "[compact] Failed: no response received".into() });
+        state.render();
+        return;
+    }
 
     let system = messages.first().cloned().unwrap_or(Message { role: Role::System, content: String::new() });
     messages.clear();
@@ -517,7 +504,8 @@ fn run_heartbeat(
     state.start_spinner("thinking...");
     state.render();
     let mut last_tokens: Option<usize> = None;
-    let tags = registry.tags();
+    let mut tags = registry.tags();
+    tags.extend(format.display_filter_tags());
 
     for round in 0..MAX_TOOL_ROUNDS {
         let resp = match call_llm(&config.llm, messages, tools_json, Some(state), Some(event_rx), &tags, queued_messages) {
@@ -594,6 +582,10 @@ fn run_heartbeat(
                                                 state.advance_cat_anim();
                                                 state.spinner.frame = (state.spinner.frame + 1) % 10;
                                                 state.tick_fade();
+                                                let dept_notifs = poll_department_completions(state);
+                                                for n in dept_notifs {
+                                                    queued_messages.push(n);
+                                                }
                                                 state.render();
                                             }
                                             Event::Resize => {
@@ -601,37 +593,7 @@ fn run_heartbeat(
                                                 state.render();
                                             }
                                             Event::Key(key) => {
-                                                match key {
-                                                    Key::Char(ch) => { state.input.insert(ch); }
-                                                    Key::ShiftEnter => { state.input.insert('\n'); }
-                                                    Key::Paste(text) => { state.input.insert_str(&text); }
-                                                    Key::Backspace => { state.input.backspace(); }
-                                                    Key::Delete => { state.input.delete(); }
-                                                    Key::Left => { state.input.move_left(); }
-                                                    Key::Right => { state.input.move_right(); }
-                                                    Key::Home => { state.input.move_home(); }
-                                                    Key::End => { state.input.move_end(); }
-                                                    Key::Enter => {
-                                                        let line = state.input.drain_all();
-                                                        let trimmed = line.trim().to_string();
-                                                        if !trimmed.is_empty() {
-                                                            if trimmed.starts_with('/') {
-                                                                handle_inline_slash(&trimmed, state, messages);
-                                                            } else {
-                                                                queued_messages.push(trimmed.clone());
-                                                                state.push_chat(ChatLine { kind: ChatLineKind::QueuedMessage, content: trimmed });
-                                                            }
-                                                        }
-                                                    }
-                                                    Key::Tab => {
-                                                        let chars = state.input.to_chars();
-                                                        let suggestion = slash_suggestion(&chars);
-                                                        state.input.move_end();
-                                                        state.input.insert_str(&suggestion);
-                                                    }
-                                                    _ => {}
-                                                }
-                                                state.render();
+                                                handle_agent_key(key, state, messages, queued_messages);
                                             }
                                         }
                                     }
@@ -799,6 +761,162 @@ fn open_config_selector(state: &mut AppState, id: &str, config: &Config) {
     }
 }
 
+/// Open the departments selector (reused by /departments command and Escape back-navigation).
+/// Poll departments for completion and return notification messages.
+/// Uses static state so it can be called from any tick handler.
+/// Start a filesystem watcher on the departments directory.
+/// Sets the DEPT_CHANGED flag when any file is modified.
+fn start_department_watcher() {
+    use notify::{RecursiveMode, Watcher};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) { return; } // already running
+
+    if let Some(base) = config::global_config_dir() {
+        let dept_dir = base.join("departments");
+        let _ = std::fs::create_dir_all(&dept_dir);
+        std::thread::spawn(move || {
+            let mut watcher = match notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
+                DEPT_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            let _ = watcher.watch(&dept_dir, RecursiveMode::Recursive);
+            // Keep thread alive — watcher is dropped if thread exits
+            loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+        });
+    }
+}
+
+static DEPT_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true); // true on first run to do initial scan
+
+fn poll_department_completions(state: &mut AppState) -> Vec<String> {
+    use std::sync::Mutex;
+    static DEPT_PREV: Mutex<Option<std::collections::HashMap<String, departments::DeptStatus>>> = Mutex::new(None);
+    static DEPT_NOTIFIED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+    // Only poll when the watcher signals a change
+    if !DEPT_CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return Vec::new();
+    }
+
+    let mut prev_guard = DEPT_PREV.lock().unwrap_or_else(|e| e.into_inner());
+    let prev_map = prev_guard.get_or_insert_with(std::collections::HashMap::new);
+    let mut notified_guard = DEPT_NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    let notified = notified_guard.get_or_insert_with(std::collections::HashSet::new);
+
+    let mut notifications = Vec::new();
+
+    if let Some(mgr) = departments::DepartmentManager::new() {
+        for dept in mgr.list() {
+            let prev = prev_map.get(&dept.name).copied();
+
+            // Zombie detection — only if we previously confirmed the process was alive
+            // (prevents false positives from stale "working" status on Stray restart)
+            if dept.status == departments::DeptStatus::Working
+                && dept.pid > 0 && !mgr.is_alive(dept.pid)
+                && prev == Some(departments::DeptStatus::Working)
+            {
+                mgr.update_status(&dept.name, departments::DeptStatus::Failed, 0);
+                state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                    content: format!("Department {BOLD}{}{RESET} failed (process died)", dept.name) });
+            }
+            let current = dept.status;
+            prev_map.insert(dept.name.clone(), current);
+
+            // Clear notification flag if resumed
+            if current == departments::DeptStatus::Working {
+                notified.remove(&dept.name);
+            }
+
+            // Completion transition
+            if prev == Some(departments::DeptStatus::Working)
+                && (current == departments::DeptStatus::Done || current == departments::DeptStatus::Failed)
+                && !notified.contains(&dept.name)
+            {
+                notified.insert(dept.name.clone());
+                let status_word = if current == departments::DeptStatus::Done { "finished" } else { "failed" };
+                let summary = if dept.progress.is_empty() { String::new() }
+                    else { format!(": {}", dept.progress) };
+                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                    content: format!("[Department {BOLD}{}{RESET} {status_word}{summary}]", dept.name) });
+
+                // Build notification for message queue
+                let output_path = mgr.dept_dir(&dept.name).join("workspace/output.md");
+                let output_preview = std::fs::read_to_string(&output_path).unwrap_or_default();
+                let output_preview = output_preview.trim();
+                let preview = if output_preview.len() > 500 {
+                    format!("{}...", &output_preview[..500])
+                } else {
+                    output_preview.to_string()
+                };
+                let check_hint = format!(
+                    "To view the full output, use: <department>\naction: check\nname: {}\n</department>",
+                    dept.name
+                );
+                let notification = if preview.is_empty() {
+                    format!("[Department '{}' {status_word}. No output was produced.]\n{check_hint}", dept.name)
+                } else {
+                    format!("[Department '{}' {status_word}. Output summary:]\n{preview}\n\n{check_hint}", dept.name)
+                };
+                notifications.push(notification);
+            }
+        }
+    }
+
+    notifications
+}
+
+fn open_departments_selector(state: &mut AppState) {
+    if let Some(mgr) = departments::DepartmentManager::new() {
+        let depts = mgr.list();
+        if depts.is_empty() {
+            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                content: format!("{DIM}No departments yet — use /department <name> <task> to create one{RESET}") });
+            state.input_label.clear(); state.input_hint.clear();
+        } else {
+            let items: Vec<SelectorItem> = depts.iter().map(|d| {
+                let status_str = match d.status {
+                    departments::DeptStatus::Working => format!("{CYAN}[working]"),
+                    departments::DeptStatus::Done => format!("{BOLD}[done]"),
+                    departments::DeptStatus::Failed => format!("{RED}[failed]"),
+                    departments::DeptStatus::Paused => format!("{YELLOW}[paused]"),
+                    departments::DeptStatus::Idle => format!("{DIM}[idle]"),
+                };
+                let progress = if d.progress.is_empty() { "—".to_string() } else { d.progress.clone() };
+                SelectorItem {
+                    label: format!("{:<18} {status_str}{RESET}  {DIM}{progress}{RESET}", d.name),
+                    value: d.name.clone(),
+                }
+            }).collect();
+            state.selector = Some(Selector::new("departments", items, 8));
+            state.input_label = "Departments".into();
+            state.input_hint = "Select a department to manage".into();
+        }
+    } else {
+        state.push_chat(ChatLine { kind: ChatLineKind::Error,
+            content: "Cannot determine config directory".into() });
+        state.input_label.clear(); state.input_hint.clear();
+    }
+}
+
+/// Open the roles selector.
+fn open_roles_selector(state: &mut AppState) {
+    let all_roles = roles::load_roles();
+    let items: Vec<SelectorItem> = all_roles.iter().map(|r| {
+        let badge = if r.builtin { format!("{DIM}built-in{RESET}") } else { format!("{CYAN}custom{RESET}") };
+        SelectorItem {
+            label: format!("{:<20} {badge}  {DIM}{}{RESET}", r.name, r.description),
+            value: r.key.clone(),
+        }
+    }).collect();
+    state.selector = Some(Selector::new("roles", items, 8));
+    state.input_label = "Roles".into();
+    state.input_hint = "View and manage agent roles".into();
+}
+
 fn save_config_field(scope: &str, field: &str, value: &str) -> Result<std::path::PathBuf, String> {
     let path = match scope {
         "local" => std::path::PathBuf::from("stray.toml"),
@@ -876,6 +994,52 @@ fn save_model_to_config(path: &std::path::Path, model: &str) -> Result<(), Strin
     std::fs::write(path, output).map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Persistent conversation history
+// ---------------------------------------------------------------------------
+
+/// Compute the history file path for the current working directory.
+/// Stored at: ~/.../cat.jskitty.stray/history/<hash>.json
+fn history_path(cwd: &str) -> Option<std::path::PathBuf> {
+    let dir = config::global_config_dir()?.join("history");
+    let _ = std::fs::create_dir_all(&dir);
+    // 16-char hex hash (first half of a djb2-style 128-bit hash)
+    let h1: u64 = cwd.bytes().fold(5381u64, |h, b| h.wrapping_mul(33).wrapping_add(b as u64));
+    let h2: u64 = cwd.bytes().fold(0x517cc1b727220a95u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+    Some(dir.join(format!("{:08x}{:08x}.json", (h1 >> 32) as u32, (h2 >> 32) as u32)))
+}
+
+/// Load conversation history from disk. Returns None if no history exists.
+fn load_history(path: &std::path::Path) -> Option<Vec<Message>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&content).ok()?;
+    if entries.is_empty() { return None; }
+    let messages: Vec<Message> = entries.iter().filter_map(|e| {
+        let role = match e["role"].as_str()? {
+            "system" => Role::System,
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            _ => return None,
+        };
+        Some(Message { role, content: e["content"].as_str()?.to_string() })
+    }).collect();
+    if messages.is_empty() { None } else { Some(messages) }
+}
+
+/// Save conversation history to disk.
+fn save_history(path: &std::path::Path, messages: &[Message]) {
+    let entries: Vec<serde_json::Value> = messages.iter().map(|m| {
+        serde_json::json!({ "role": m.role.as_str(), "content": m.content })
+    }).collect();
+    if let Ok(json) = serde_json::to_string_pretty(&entries) {
+        // Atomic write
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let cmd = if cfg!(target_os = "macos") { "pbcopy" }
         else if cfg!(target_os = "windows") { "clip" }
@@ -894,6 +1058,142 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 }
 
 /// Handle safe slash commands during agent execution. Returns true if handled.
+/// Handle a key press during agent execution (call_llm or tool polling).
+/// Manages selector navigation (departments) and regular input/queuing.
+fn handle_agent_key(
+    key: Key, state: &mut AppState, messages: &[Message], queued_messages: &mut Vec<String>,
+) {
+    // Selector navigation (departments menu while Stray works)
+    if state.selector.is_some() {
+        match key {
+            Key::Down => { state.selector.as_mut().unwrap().move_down(); }
+            Key::Up => { state.selector.as_mut().unwrap().move_up(); }
+            Key::Escape => {
+                if let Some(sel) = state.selector.take() {
+                    if sel.id.starts_with("departments") {
+                        if sel.id.contains(':') {
+                            open_departments_selector(state);
+                        } else {
+                            state.input_label.clear(); state.input_hint.clear();
+                        }
+                    } else {
+                        state.input_label.clear(); state.input_hint.clear();
+                    }
+                }
+            }
+            Key::Enter => {
+                let sel = state.selector.take().unwrap();
+                let sel_value = sel.items[sel.selected].value.clone();
+                let sel_id = sel.id.clone();
+                if sel_id == "departments" {
+                    let (is_running, has_output) = if let Some(mgr) = departments::DepartmentManager::new() {
+                        let running = mgr.load_meta(&sel_value).map(|m|
+                            m.status == departments::DeptStatus::Working
+                            && m.pid > 0 && mgr.is_alive(m.pid)
+                        ).unwrap_or(false);
+                        let dir = mgr.dept_dir(&sel_value);
+                        let has_out = std::fs::read_to_string(dir.join("workspace/output.md"))
+                            .or_else(|_| std::fs::read_to_string(dir.join("output.md")))
+                            .map(|c| !c.trim().is_empty()).unwrap_or(false);
+                        (running, has_out)
+                    } else { (false, false) };
+                    let mut items = Vec::new();
+                    if is_running {
+                        items.push(SelectorItem { label: "Message".into(), value: "message".into() });
+                    } else {
+                        items.push(SelectorItem { label: "Resume".into(), value: "resume".into() });
+                    }
+                    if has_output {
+                        items.push(SelectorItem { label: "View Output".into(), value: "output".into() });
+                    }
+                    if is_running {
+                        items.push(SelectorItem { label: "Pause".into(), value: "pause".into() });
+                    }
+                    items.push(SelectorItem { label: "Delete".into(), value: "delete".into() });
+                    let count = items.len();
+                    state.selector = Some(Selector::new(&format!("departments:{sel_value}"), items, count));
+                    state.input_label = sel_value;
+                    state.input_hint = "Choose an action".into();
+                } else if sel_id.starts_with("departments:") {
+                    let dept_name = sel_id.strip_prefix("departments:").unwrap_or("");
+                    if let Some(mgr) = departments::DepartmentManager::new() {
+                        match sel_value.as_str() {
+                            "output" => {
+                                let dir = mgr.dept_dir(dept_name);
+                                let path = dir.join("workspace/output.md");
+                                let path = if path.exists() { path } else { dir.join("output.md") };
+                                match std::fs::read_to_string(&path) {
+                                    Ok(content) if !content.trim().is_empty() => {
+                                        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                            content: format!("{BOLD}{dept_name} output:{RESET}") });
+                                        state.push_chat(ChatLine { kind: ChatLineKind::AgentText,
+                                            content: content.trim().to_string() });
+                                    }
+                                    _ => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                        content: format!("{DIM}No output yet{RESET}") }),
+                                }
+                            }
+                            "pause" => {
+                                mgr.pause(dept_name);
+                                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                    content: format!("Pause requested for {BOLD}{dept_name}{RESET}") });
+                            }
+                            "delete" => {
+                                match mgr.delete(dept_name) {
+                                    Ok(()) => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                        content: format!("Department {BOLD}{dept_name}{RESET} deleted") }),
+                                    Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e }),
+                                }
+                            }
+                            _ => {
+                                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                    content: format!("{DIM}Use this action from the prompt{RESET}") });
+                            }
+                        }
+                    }
+                    open_departments_selector(state);
+                }
+            }
+            _ => {}
+        }
+        state.render();
+        return;
+    }
+
+    // Regular input handling
+    match key {
+        Key::Char(ch) => { state.input.insert(ch); }
+        Key::ShiftEnter => { state.input.insert('\n'); }
+        Key::Paste(text) => { state.input.insert_str(&text); }
+        Key::Backspace => { state.input.backspace(); }
+        Key::Delete => { state.input.delete(); }
+        Key::Left => { state.input.move_left(); }
+        Key::Right => { state.input.move_right(); }
+        Key::Home => { state.input.move_home(); }
+        Key::End => { state.input.move_end(); }
+        Key::Enter => {
+            let line = state.input.drain_all();
+            let trimmed = line.trim().to_string();
+            if !trimmed.is_empty() {
+                if trimmed.starts_with('/') {
+                    handle_inline_slash(&trimmed, state, messages);
+                } else {
+                    queued_messages.push(trimmed.clone());
+                    state.push_chat(ChatLine { kind: ChatLineKind::QueuedMessage, content: trimmed });
+                }
+            }
+        }
+        Key::Tab => {
+            let chars = state.input.to_chars();
+            let suggestion = slash_suggestion(&chars);
+            state.input.move_end();
+            state.input.insert_str(&suggestion);
+        }
+        _ => {}
+    }
+    state.render();
+}
+
 fn handle_inline_slash(
     trimmed: &str, state: &mut AppState, messages: &[Message],
 ) -> bool {
@@ -927,6 +1227,9 @@ fn handle_inline_slash(
                 kind: ChatLineKind::SystemInfo,
                 content: format!("Context: ~{est} tokens ({} messages)", messages.len()),
             });
+        }
+        "/departments" => {
+            open_departments_selector(state);
         }
         "/exit" => {
             print!("\x1b[?1049l");
@@ -1069,6 +1372,16 @@ fn apply_config_change(config: &mut Config, field: &str, value: &str) {
 }
 
 fn main() {
+    // Department headless mode: stray --department <name>
+    // Must be checked BEFORE config::load() (which reads args().nth(1) as config path)
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() >= 3 && args[1] == "--department" {
+            departments::run_headless(&args[2]);
+            return;
+        }
+    }
+
     // Panic hook: restore terminal
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1091,12 +1404,15 @@ fn main() {
 
     // Register tools (vision flag is shared so model switches update it)
     let vision_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llm.vision));
+    // Shared LLM config for DepartmentTool (snapshot at department creation time)
+    let shared_llm = std::sync::Arc::new(std::sync::Mutex::new(config.llm.clone()));
     let registry = {
         let mut r = ToolRegistry::new();
         r.add(Box::new(tools::BashTool));
         r.add(Box::new(tools::ReadTool::new(vision_flag.clone())));
         r.add(Box::new(tools::WriteTool));
         r.add(Box::new(tools::EditTool));
+        r.add(Box::new(departments::DepartmentTool::new(shared_llm.clone())));
         r
     };
 
@@ -1126,16 +1442,49 @@ fn main() {
     state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
     state.render();
 
-    let mut messages: Vec<Message> = vec![Message { role: Role::System, content: system }];
+    // Persistent history: load previous conversation if it exists
+    let hist_path = history_path(&cwd);
+    let mut messages: Vec<Message> = if let Some(ref hp) = hist_path {
+        if let Some(mut loaded) = load_history(hp) {
+            // Always refresh the system prompt (config may have changed)
+            if let Some(first) = loaded.first_mut() {
+                first.content = system.clone();
+            }
+            // Replay messages into chat UI (skip system message)
+            for msg in loaded.iter().skip(1) {
+                let kind = match msg.role {
+                    Role::User => ChatLineKind::UserMessage,
+                    Role::Assistant => ChatLineKind::AgentText,
+                    Role::System => ChatLineKind::SystemInfo,
+                };
+                state.push_chat(ChatLine { kind, content: msg.content.clone() });
+            }
+            if loaded.len() > 1 {
+                state.push_chat(ChatLine {
+                    kind: ChatLineKind::SystemInfo,
+                    content: format!("{DIM}── resumed from previous session ──{RESET}"),
+                });
+            }
+            loaded
+        } else {
+            vec![Message { role: Role::System, content: system }]
+        }
+    } else {
+        vec![Message { role: Role::System, content: system }]
+    };
 
     // Event channels (input thread + tick thread + resize watcher)
     let event_rx = event::setup_event_channels();
+
+    // Filesystem watcher for department changes (instant notifications)
+    start_department_watcher();
 
     // Signal safety net — restores terminal on SIGINT/SIGTERM even if event loop is stuck
     event::setup_signal_handlers();
 
     // Ctrl+C double-tap state
     let mut last_ctrlc: u64 = 0;
+
 
     // --- Main event loop ---
     loop {
@@ -1144,6 +1493,7 @@ fn main() {
         state.render();
 
         let mut user_input: Option<String> = None;
+        let mut dept_notification: Option<Vec<String>> = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(config.agent.heartbeat);
 
         'prompt: loop {
@@ -1195,10 +1545,111 @@ fn main() {
                                             content: format!("Switched to {BOLD}{value}{RESET}"),
                                         });
                                         state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
+                                        if let Ok(mut sl) = shared_llm.lock() { *sl = config.llm.clone(); }
                                         if let Err(e) = save_model_to_config(&config_path, &value) {
                                             state.push_chat(ChatLine { kind: ChatLineKind::Error, content: format!("Config save failed: {e}") });
                                         }
                                     }
+                                } else if sel_id == "roles" {
+                                    // Roles selector — show role details
+                                    if let Some(role) = roles::find_role(&value) {
+                                        let tools_list = role.tools.join(", ");
+                                        let rounds = if role.max_rounds == 0 { "unlimited".to_string() } else { role.max_rounds.to_string() };
+                                        let llm_info = match &role.llm {
+                                            Some(l) => format!("{} @ {}", l.model, l.api_url),
+                                            None => "inherits global".into(),
+                                        };
+                                        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: format!(
+                                            "{BOLD}{}{RESET}  {DIM}{}{RESET}\n  Tools: {}\n  Max rounds: {}\n  LLM: {}\n  {DIM}{}{RESET}",
+                                            role.name, if role.builtin { " (built-in)" } else { "" },
+                                            tools_list, rounds, llm_info,
+                                            role.system_prompt.lines().next().unwrap_or("")
+                                        )});
+                                    }
+                                    state.input_label.clear(); state.input_hint.clear();
+                                } else if sel_id == "departments" {
+                                    // Selected a department — show action menu (dynamic based on status)
+                                    let dept_name = value.clone();
+                                    let (is_running, has_output) = if let Some(mgr) = departments::DepartmentManager::new() {
+                                        let running = mgr.load_meta(&dept_name).map(|m|
+                                            m.status == departments::DeptStatus::Working
+                                            && m.pid > 0 && mgr.is_alive(m.pid)
+                                        ).unwrap_or(false);
+                                        let dir = mgr.dept_dir(&dept_name);
+                                        let output_path = dir.join("workspace/output.md");
+                                        let has_out = std::fs::read_to_string(&output_path)
+                                            .or_else(|_| std::fs::read_to_string(dir.join("output.md")))
+                                            .map(|s| !s.trim().is_empty())
+                                            .unwrap_or(false);
+                                        (running, has_out)
+                                    } else { (false, false) };
+
+                                    let mut items = Vec::new();
+                                    if is_running {
+                                        items.push(SelectorItem { label: "Message".into(), value: "message".into() });
+                                    } else {
+                                        items.push(SelectorItem { label: "Resume".into(), value: "resume".into() });
+                                    }
+                                    if has_output {
+                                        items.push(SelectorItem { label: "View Output".into(), value: "output".into() });
+                                    }
+                                    if is_running {
+                                        items.push(SelectorItem { label: "Pause".into(), value: "pause".into() });
+                                    }
+                                    items.push(SelectorItem { label: "Delete".into(), value: "delete".into() });
+
+                                    let count = items.len();
+                                    state.selector = Some(Selector::new(
+                                        &format!("departments:{dept_name}"), items, count));
+                                    state.input_label = dept_name;
+                                    state.input_hint = "Choose an action".into();
+                                } else if sel_id.starts_with("departments:") {
+                                    // Department action selected
+                                    let dept_name = sel_id.strip_prefix("departments:").unwrap_or("");
+                                    if let Some(mgr) = departments::DepartmentManager::new() {
+                                        match value.as_str() {
+                                            "resume" | "message" => {
+                                                // Enter text input for optional message — skip departments selector
+                                                state.config_edit = Some(("dept".to_string(), dept_name.to_string()));
+                                                state.input.clear();
+                                                state.input_label = format!("{dept_name} (Enter to send, ESC to cancel)");
+                                                state.input_hint = "Optional message for the department (empty = just resume)".into();
+                                                state.render();
+                                                continue 'prompt;
+                                            }
+                                            "output" => {
+                                                let dir = mgr.dept_dir(dept_name);
+                                                let path = dir.join("workspace/output.md");
+                                                let path = if path.exists() { path } else { dir.join("output.md") };
+                                                match std::fs::read_to_string(&path) {
+                                                    Ok(content) if !content.trim().is_empty() => {
+                                                        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                            content: format!("{BOLD}{dept_name} output:{RESET}") });
+                                                        // Render as AgentText for proper markdown/wrapping
+                                                        state.push_chat(ChatLine { kind: ChatLineKind::AgentText,
+                                                            content: content.trim().to_string() });
+                                                    }
+                                                    _ => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                        content: format!("{DIM}No output yet{RESET}") }),
+                                                }
+                                            }
+                                            "pause" => {
+                                                mgr.pause(dept_name);
+                                                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                    content: format!("Pause requested for {BOLD}{dept_name}{RESET}") });
+                                            }
+                                            "delete" => {
+                                                match mgr.delete(dept_name) {
+                                                    Ok(()) => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                        content: format!("Department {BOLD}{dept_name}{RESET} deleted") }),
+                                                    Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e }),
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    // Return to departments overview
+                                    open_departments_selector(&mut state);
                                 } else {
                                     // Config menu routing (nested selectors)
                                     let parts: Vec<&str> = sel_id.split(':').collect();
@@ -1254,6 +1705,7 @@ fn main() {
                                                         msg.content = build_system_prompt(&config, &*format, &registry, &cwd);
                                                     }
                                                     state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
+                                                    if let Ok(mut sl) = shared_llm.lock() { *sl = config.llm.clone(); }
                                                     if needs_key && !restored {
                                                         // New provider with no saved key — open key editor
                                                         state.config_edit = Some((scope.clone(), "api_key".to_string()));
@@ -1281,7 +1733,11 @@ fn main() {
                                 // Back-navigate: selectors with ':' in id have a parent
                                 if let Some(sel) = state.selector.take() {
                                     if let Some((parent, _)) = sel.id.rsplit_once(':') {
-                                        open_config_selector(&mut state, parent, &config);
+                                        if parent == "departments" {
+                                            open_departments_selector(&mut state);
+                                        } else {
+                                            open_config_selector(&mut state, parent, &config);
+                                        }
                                     } else {
                                         state.input_label.clear(); state.input_hint.clear();
                                     }
@@ -1402,14 +1858,20 @@ fn main() {
                             }
                             last_ctrlc = 0;
                         }
+                        Key::AltUp => {
+                            state.scroll_offset += 10;
+                            last_ctrlc = 0;
+                        }
+                        Key::AltDown => {
+                            state.scroll_offset = state.scroll_offset.saturating_sub(10);
+                            last_ctrlc = 0;
+                        }
                         Key::PageUp => {
-                            let chat_h = state.height.saturating_sub(state.header_lines.len() + 3);
-                            state.scroll_offset += chat_h.max(1);
+                            state.scroll_offset += 10;
                             last_ctrlc = 0;
                         }
                         Key::PageDown => {
-                            let chat_h = state.height.saturating_sub(state.header_lines.len() + 3);
-                            state.scroll_offset = state.scroll_offset.saturating_sub(chat_h.max(1));
+                            state.scroll_offset = state.scroll_offset.saturating_sub(10);
                             last_ctrlc = 0;
                         }
                         Key::Home => { state.input.move_home(); last_ctrlc = 0; }
@@ -1425,8 +1887,13 @@ fn main() {
                         }
                         Key::Escape => {
                             if let Some((scope, _)) = state.config_edit.take() {
-                                // Cancel config edit, return to options menu
-                                open_config_selector(&mut state, &format!("config:{scope}"), &config);
+                                if scope == "dept" {
+                                    // Cancel dept message, return to departments list
+                                    open_departments_selector(&mut state);
+                                } else {
+                                    // Cancel config edit, return to options menu
+                                    open_config_selector(&mut state, &format!("config:{scope}"), &config);
+                                }
                             }
                             state.input.clear();
                         }
@@ -1470,6 +1937,31 @@ fn main() {
                     if state.tick_fade() {
                         state.render();
                     }
+                    // Department status polling (~every 2.4s)
+                    {
+                        let dept_notifs = poll_department_completions(&mut state);
+                        // Auto-refresh departments selector if it's currently open
+                        if let Some(ref sel) = state.selector {
+                            if sel.id == "departments" || sel.id.starts_with("departments:") {
+                                let old_selected = sel.selected;
+                                let old_id = sel.id.clone();
+                                if old_id == "departments" {
+                                    open_departments_selector(&mut state);
+                                    // Preserve selection position
+                                    if let Some(ref mut s) = state.selector {
+                                        s.selected = old_selected.min(s.items.len().saturating_sub(1));
+                                    }
+                                }
+                                state.render();
+                            }
+                        }
+                        if !dept_notifs.is_empty() {
+                            // Trigger agent — notifications hoisted to top of queued messages
+                            dept_notification = Some(dept_notifs);
+                            state.render();
+                            break 'prompt;
+                        }
+                    }
                     // Clear expired Ctrl+C hint
                     if last_ctrlc > 0 && now_millis() - last_ctrlc >= 2000 {
                         last_ctrlc = 0;
@@ -1500,8 +1992,67 @@ fn main() {
 
         // AGENT PHASE
         if let Some(text) = user_input {
-            // Config edit mode — save the entered value
+            // Department message mode
             if let Some((scope, field)) = state.config_edit.take() {
+                if scope == "dept" {
+                    state.input_label.clear(); state.input_hint.clear();
+                    let dept_name = field;
+                    let message = text.trim().to_string();
+                    if let Some(mgr) = departments::DepartmentManager::new() {
+                        // Inject message if non-empty
+                        if !message.is_empty() {
+                            let history_path = mgr.dept_dir(&dept_name).join("history.json");
+                            // Frame as follow-up task if department was completed
+                            let is_done = mgr.load_meta(&dept_name).map(|m|
+                                m.status == departments::DeptStatus::Done || m.status == departments::DeptStatus::Failed
+                            ).unwrap_or(false);
+                            let msg_content = if is_done {
+                                format!("[{}] [System] You have a new follow-up task. Act on this and update ./output.md and ./progress.txt with your new results:\n{message}", timestamp())
+                            } else {
+                                format!("[{}] {message}", timestamp())
+                            };
+                            if let Ok(content) = std::fs::read_to_string(&history_path) {
+                                if let Ok(mut entries) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+                                    entries.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": msg_content
+                                    }));
+                                    if let Ok(json) = serde_json::to_string_pretty(&entries) {
+                                        let _ = std::fs::write(&history_path, &json);
+                                    }
+                                }
+                            }
+                        }
+                        // Check if already running
+                        let is_running = mgr.load_meta(&dept_name).map(|m|
+                            m.status == departments::DeptStatus::Working
+                            && m.pid > 0 && mgr.is_alive(m.pid)
+                        ).unwrap_or(false);
+
+                        if is_running {
+                            let msg_preview = if message.is_empty() { String::new() }
+                                else { format!(": \"{message}\"") };
+                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                content: format!("Message queued for {BOLD}{dept_name}{RESET}{msg_preview}") });
+                        } else {
+                            match mgr.spawn(&dept_name) {
+                                Ok(pid) => {
+                                    let msg_preview = if message.is_empty() { String::new() }
+                                        else { format!(" with message") };
+                                    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                        content: format!("Department {BOLD}{dept_name}{RESET} resumed{msg_preview} (PID {pid})") });
+                                }
+                                Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e }),
+                            }
+                        }
+                    }
+                    // Return to departments overview
+                    open_departments_selector(&mut state);
+                    state.render();
+                    continue;
+                }
+
+                // Config edit mode — save the entered value
                 state.input_label.clear(); state.input_hint.clear();
                 // Sanitize single-line fields
                 let value = match field.as_str() {
@@ -1682,12 +2233,73 @@ fn main() {
                     "/config" => {
                         open_config_selector(&mut state, "config", &config);
                     }
+                    "/roles" => {
+                        open_roles_selector(&mut state);
+                    }
+                    "/departments" => {
+                        open_departments_selector(&mut state);
+                    }
+                    "/department" => {
+                        // Quick create: /department <name> [role:<key>] <task...>
+                        if args.is_empty() {
+                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                content: format!("{DIM}Usage: /department <name> [role:<key>] <task description>{RESET}") });
+                        } else {
+                            let mut words = args.splitn(2, ' ');
+                            let dept_name = words.next().unwrap_or("").to_lowercase().replace(' ', "-");
+                            let rest = words.next().unwrap_or("");
+
+                            // Parse optional role: prefix
+                            let (role_key, task) = if let Some(stripped) = rest.strip_prefix("role:") {
+                                let mut parts = stripped.splitn(2, ' ');
+                                let rk = parts.next().unwrap_or("software-engineer");
+                                let t = parts.next().unwrap_or("");
+                                (rk.to_string(), t.to_string())
+                            } else {
+                                ("software-engineer".to_string(), rest.to_string())
+                            };
+
+                            if task.is_empty() {
+                                state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                    content: "Task description required".into() });
+                            } else if let Some(role) = roles::find_role(&role_key) {
+                                if let Some(mgr) = departments::DepartmentManager::new() {
+                                    let llm_snap = shared_llm.lock().map(|c| c.clone())
+                                        .unwrap_or(config.llm.clone());
+                                    match mgr.create(&dept_name, &role, &task, &llm_snap, config.agent.compact_at) {
+                                        Ok(_) => {
+                                            match mgr.spawn(&dept_name) {
+                                                Ok(pid) => {
+                                                    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                        content: format!("Department {BOLD}{dept_name}{RESET} created — role: {}, PID: {pid}", role.name) });
+                                                }
+                                                Err(e) => {
+                                                    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                        content: format!("Department {BOLD}{dept_name}{RESET} created but failed to start: {e}") });
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e });
+                                        }
+                                    }
+                                }
+                            } else {
+                                state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                    content: format!("Unknown role: {role_key}") });
+                            }
+                        }
+                    }
                     "/clear" => {
                         let sys = messages.first().cloned().unwrap_or(Message { role: Role::System, content: String::new() });
                         messages.clear();
                         messages.push(sys);
                         state.chat.clear();
                         state.build_header(&config, &tools_str, fmt_str, &config_path, config_source);
+                        // Clear persistent history
+                        if let Some(ref hp) = hist_path {
+                            let _ = std::fs::remove_file(hp);
+                        }
                     }
                     "/exit" => {
                         print!("\x1b[?1049l");
@@ -1719,6 +2331,47 @@ fn main() {
             }
 
             // Process queued messages — merge batch into one API call
+            while !queued.is_empty() {
+                let batch: Vec<String> = queued.drain(..).collect();
+                for q in &batch {
+                    if let Some(pos) = state.chat.iter().position(|l| matches!(l.kind, ChatLineKind::QueuedMessage) && l.content == *q) {
+                        state.chat[pos].kind = ChatLineKind::UserMessage;
+                    }
+                }
+                state.render();
+                let (qt, new_queued) = run_heartbeat(
+                    &config, &registry, &*format, &tools_json,
+                    &mut messages, batch, &mut state, &event_rx, &mut queued,
+                );
+                queued.extend(new_queued);
+                let tc = qt.unwrap_or_else(|| estimate_tokens(&messages));
+                if tc >= config.agent.compact_at {
+                    compact_context(&config.llm, &mut messages, tc, &mut state, &event_rx);
+                }
+            }
+        } else if let Some(notifications) = dept_notification {
+            // Department completed — notifications are merged with any queued user messages
+            // Notifications hoisted to top, user messages after
+            state.render();
+
+            // Combine: [dept notifications] + [any queued user messages from during the prompt phase]
+            let mut batch = notifications;
+            // Note: user messages queued during prompt phase would be in user_input,
+            // but dept_notification breaks the prompt loop before user input is captured.
+            // Any messages queued during the AGENT phase will be handled by run_heartbeat's queue.
+
+            let mut queued = Vec::new();
+            let (api_tokens, new_queued) = run_heartbeat(
+                &config, &registry, &*format, &tools_json,
+                &mut messages, batch, &mut state, &event_rx, &mut queued,
+            );
+            queued.extend(new_queued);
+
+            let token_count = api_tokens.unwrap_or_else(|| estimate_tokens(&messages));
+            if token_count >= config.agent.compact_at {
+                compact_context(&config.llm, &mut messages, token_count, &mut state, &event_rx);
+            }
+
             while !queued.is_empty() {
                 let batch: Vec<String> = queued.drain(..).collect();
                 for q in &batch {
@@ -1777,10 +2430,15 @@ fn main() {
                 }
             }
         }
+
+        // Save conversation history after each agent phase
+        if let Some(ref hp) = hist_path {
+            save_history(hp, &messages);
+        }
     }
 }
 
-fn timestamp() -> String {
+pub(crate) fn timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1794,7 +2452,7 @@ fn timestamp() -> String {
     }
 }
 
-fn date_today() -> String {
+pub(crate) fn date_today() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
