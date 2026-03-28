@@ -14,15 +14,21 @@ A living AI companion for the terminal. Autonomous, sovereign, with a heartbeat.
 - **Custom TUI engine** — high-performance full-screen renderer with animations, syntax highlighting, and streaming fade-in
 - **Deep config system** — per-provider settings with hot-swap, local and global configs
 - **Interactive or Autonomous modes** — use as a chat companion or an autonomous agent with heartbeat
+- **Departments** — sandboxed sub-agents that work independently, with roles, persistent workspaces, and auto-notifications
+- **Self-updating** — `/update` checks for and installs the latest version
 - **LMStudio and PPQ support** — plus any OpenAI-compatible API
 
 ## Install
 
 ```bash
-cargo install --path .
+curl -sSf https://stray.jskitty.cat/install.sh | sh
 ```
 
-Requires Rust 1.70+. No runtime dependencies beyond libc.
+Or build from source:
+
+```bash
+cargo install --git https://github.com/JSKitty/stray
+```
 
 ## Quick Start
 

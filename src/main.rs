@@ -995,6 +995,194 @@ fn save_model_to_config(path: &std::path::Path, model: &str) -> Result<(), Strin
 }
 
 // ---------------------------------------------------------------------------
+// Self-updater
+// ---------------------------------------------------------------------------
+
+const GITHUB_REPO: &str = "JSKitty/stray";
+
+/// Check for updates and self-update the binary if a newer version is available.
+fn self_update(state: &mut AppState) {
+    use std::time::Duration;
+
+    state.start_spinner("checking for updates...");
+    state.render();
+
+    // Fetch latest release from GitHub API
+    let api_url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let resp = match ureq::get(&api_url)
+        .set("User-Agent", "stray-updater")
+        .timeout(Duration::from_secs(10))
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.stop_spinner();
+            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                content: format!("Update check failed: {e}") });
+            return;
+        }
+    };
+
+    let body: serde_json::Value = match resp.into_string()
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            state.stop_spinner();
+            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                content: format!("Failed to parse release info: {e}") });
+            return;
+        }
+    };
+
+    let latest_tag = body["tag_name"].as_str().unwrap_or("");
+    let latest_ver = latest_tag.trim_start_matches('v');
+    let current_ver = config::VERSION;
+
+    if latest_ver.is_empty() {
+        state.stop_spinner();
+        state.push_chat(ChatLine { kind: ChatLineKind::Error,
+            content: "Could not determine latest version".into() });
+        return;
+    }
+
+    if latest_ver == current_ver {
+        state.stop_spinner();
+        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+            content: format!("Already on the latest version ({BOLD}v{current_ver}{RESET})") });
+        return;
+    }
+
+    // Determine platform binary name
+    let os = if cfg!(target_os = "macos") { "macos" }
+        else if cfg!(target_os = "linux") { "linux" }
+        else {
+            state.stop_spinner();
+            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                content: "Unsupported platform for auto-update".into() });
+            return;
+        };
+    let arch = if cfg!(target_arch = "x86_64") { "x86_64" }
+        else if cfg!(target_arch = "aarch64") { "aarch64" }
+        else {
+            state.stop_spinner();
+            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                content: "Unsupported architecture for auto-update".into() });
+            return;
+        };
+
+    let asset_name = format!("stray-{os}-{arch}.tar.gz");
+    let download_url = format!(
+        "https://github.com/{GITHUB_REPO}/releases/download/{latest_tag}/{asset_name}"
+    );
+
+    state.spinner.label = format!("downloading v{latest_ver}...");
+    state.render();
+
+    // Download to temp file
+    let tmp_dir = std::env::temp_dir().join("stray-update");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tar_path = tmp_dir.join(&asset_name);
+
+    let resp = match ureq::get(&download_url)
+        .timeout(Duration::from_secs(120))
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.stop_spinner();
+            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                content: format!("Download failed: {e}") });
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+    };
+
+    // Read response body to file
+    let mut bytes = Vec::new();
+    if let Err(e) = resp.into_reader().read_to_end(&mut bytes) {
+        state.stop_spinner();
+        state.push_chat(ChatLine { kind: ChatLineKind::Error,
+            content: format!("Download read failed: {e}") });
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return;
+    }
+    if let Err(e) = std::fs::write(&tar_path, &bytes) {
+        state.stop_spinner();
+        state.push_chat(ChatLine { kind: ChatLineKind::Error,
+            content: format!("Failed to save download: {e}") });
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return;
+    }
+
+    state.spinner.label = "installing...".into();
+    state.render();
+
+    // Extract tar.gz
+    let extract = std::process::Command::new("tar")
+        .args(["xzf", &tar_path.to_string_lossy(), "-C", &tmp_dir.to_string_lossy()])
+        .output();
+
+    if let Err(e) = extract {
+        state.stop_spinner();
+        state.push_chat(ChatLine { kind: ChatLineKind::Error,
+            content: format!("Extraction failed: {e}") });
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return;
+    }
+
+    let new_binary = tmp_dir.join("stray");
+    if !new_binary.exists() {
+        state.stop_spinner();
+        state.push_chat(ChatLine { kind: ChatLineKind::Error,
+            content: "Extracted binary not found".into() });
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return;
+    }
+
+    // Replace current binary atomically
+    let current_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            state.stop_spinner();
+            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                content: format!("Cannot locate current binary: {e}") });
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+    };
+
+    // Set executable permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&new_binary,
+            std::fs::Permissions::from_mode(0o755));
+    }
+
+    // Atomic replace: rename new over old
+    if let Err(e) = std::fs::rename(&new_binary, &current_exe) {
+        // rename may fail across filesystems — fall back to copy
+        if let Err(e2) = std::fs::copy(&new_binary, &current_exe) {
+            state.stop_spinner();
+            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                content: format!("Failed to replace binary: {e}, copy also failed: {e2}") });
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    state.stop_spinner();
+    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+        content: format!("Updated {BOLD}v{current_ver}{RESET} → {BOLD}v{latest_ver}{RESET} — restart Stray to use the new version") });
+}
+
+use std::io::Read;
+
+// ---------------------------------------------------------------------------
 // Persistent conversation history
 // ---------------------------------------------------------------------------
 
@@ -1372,10 +1560,13 @@ fn apply_config_change(config: &mut Config, field: &str, value: &str) {
 }
 
 fn main() {
-    // Department headless mode: stray --department <name>
-    // Must be checked BEFORE config::load() (which reads args().nth(1) as config path)
+    // CLI flags — checked BEFORE config::load() (which reads args().nth(1) as config path)
     {
         let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--version" || a == "-v") {
+            println!("stray {}", config::VERSION);
+            return;
+        }
         if args.len() >= 3 && args[1] == "--department" {
             departments::run_headless(&args[2]);
             return;
@@ -2289,6 +2480,9 @@ fn main() {
                                     content: format!("Unknown role: {role_key}") });
                             }
                         }
+                    }
+                    "/update" => {
+                        self_update(&mut state);
                     }
                     "/clear" => {
                         let sys = messages.first().cloned().unwrap_or(Message { role: Role::System, content: String::new() });
