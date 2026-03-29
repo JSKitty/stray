@@ -866,11 +866,14 @@ fn render_selector(out: &mut String, selector: &Selector, width: usize) {
 }
 
 /// Render content with code block support: text → markdown, code → syntect highlighting.
-fn render_content_with_code(content: &str, md: &mut MarkdownRenderer, md_out: &mut String, is_streaming: bool) -> String {
+fn render_content_with_code(content: &str, md: &mut MarkdownRenderer, md_out: &mut String, is_streaming: bool, width: usize) -> String {
     let segments = highlight::split_code_blocks(content);
-    // If no code blocks, fast path
+    // If no code blocks, fast path — check for tables
     if segments.len() == 1 {
         if let highlight::Segment::Text(t) = &segments[0] {
+            if t.lines().any(|l| is_table_line(l)) {
+                return render_text_with_tables(t, md, md_out, is_streaming, width.saturating_sub(4));
+            }
             *md = MarkdownRenderer::new();
             md_out.clear();
             md.feed(t, md_out);
@@ -882,11 +885,15 @@ fn render_content_with_code(content: &str, md: &mut MarkdownRenderer, md_out: &m
     for seg in &segments {
         match seg {
             highlight::Segment::Text(text) => {
-                *md = MarkdownRenderer::new();
-                md_out.clear();
-                md.feed(text, md_out);
-                if is_streaming { md.flush_streaming(md_out); } else { md.flush(md_out); }
-                out.push_str(md_out);
+                if text.lines().any(|l| is_table_line(l)) {
+                    out.push_str(&render_text_with_tables(text, md, md_out, is_streaming, width.saturating_sub(4)));
+                } else {
+                    *md = MarkdownRenderer::new();
+                    md_out.clear();
+                    md.feed(text, md_out);
+                    if is_streaming { md.flush_streaming(md_out); } else { md.flush(md_out); }
+                    out.push_str(md_out);
+                }
             }
             highlight::Segment::Code { lang, code } => {
                 // Ensure code block starts on its own line
@@ -898,6 +905,186 @@ fn render_content_with_code(content: &str, md: &mut MarkdownRenderer, md_out: &m
             }
         }
     }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Table renderer
+// ---------------------------------------------------------------------------
+
+/// Check if a line looks like a markdown table row (starts and ends with |, or starts with |)
+fn is_table_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.contains('|')
+}
+
+/// Check if a line is a table separator (|---|---|)
+fn is_separator_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.chars().all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+}
+
+/// Render a markdown table block into ANSI-styled lines.
+/// Truncates columns to fit within `max_width`.
+fn render_table(table_lines: &[&str], max_width: usize) -> String {
+    if table_lines.is_empty() { return String::new(); }
+
+    // Parse rows into cells
+    let rows: Vec<Vec<String>> = table_lines.iter()
+        .filter(|l| !is_separator_line(l))
+        .map(|line| {
+            line.trim().trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        })
+        .collect();
+
+    if rows.is_empty() { return String::new(); }
+
+    let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if num_cols == 0 { return String::new(); }
+
+    // Calculate natural column widths (max content width per column)
+    let mut col_widths: Vec<usize> = vec![0; num_cols];
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < num_cols {
+                col_widths[i] = col_widths[i].max(cell.chars().count());
+            }
+        }
+    }
+
+    // Ensure minimum width of 3 per column
+    for w in col_widths.iter_mut() {
+        *w = (*w).max(3);
+    }
+
+    // Truncate to fit max_width: account for | separators and padding
+    // Format: "| cell | cell | cell |" → 3 chars overhead per col + 1 final |
+    let overhead = num_cols * 3 + 1;
+    let available = max_width.saturating_sub(overhead);
+    let total_natural: usize = col_widths.iter().sum();
+
+    if total_natural > available && available > 0 {
+        // Scale down proportionally
+        for w in col_widths.iter_mut() {
+            *w = ((*w as f64 / total_natural as f64) * available as f64).max(3.0) as usize;
+        }
+    }
+
+    let mut out = String::from("\n"); // spacing before table
+
+    // Render a cell with markdown and pad/truncate to width
+    let render_cell = |cell_raw: &str, width: usize| -> String {
+        let mut cell_md = MarkdownRenderer::new();
+        let mut cell_out = String::new();
+        cell_md.feed(cell_raw, &mut cell_out);
+        cell_md.flush(&mut cell_out);
+        let vis_width = strip_ansi_width(&cell_out);
+        if vis_width > width {
+            let truncated: String = cell_raw.chars().take(width - 1).collect();
+            let mut trunc_md = MarkdownRenderer::new();
+            let mut trunc_out = String::new();
+            trunc_md.feed(&truncated, &mut trunc_out);
+            trunc_md.flush(&mut trunc_out);
+            format!("{trunc_out}{RESET}…")
+        } else {
+            let padding = width.saturating_sub(vis_width);
+            format!("{cell_out}{RESET}{:padding$}", "", padding = padding)
+        }
+    };
+
+    // Top border: ╭──────┬──────╮
+    out.push_str(&format!("{DIM}╭"));
+    for (i, width) in col_widths.iter().enumerate() {
+        for _ in 0..*width + 2 { out.push('─'); }
+        if i + 1 < num_cols { out.push('┬'); } else { out.push('╮'); }
+    }
+    out.push_str(&format!("{RESET}\n"));
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        // Row content: │ cell │ cell │
+        out.push_str(&format!("{DIM}│{RESET}"));
+        for (i, width) in col_widths.iter().enumerate() {
+            let cell_raw = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            let display = render_cell(cell_raw, *width);
+
+            if row_idx == 0 {
+                out.push_str(&format!(" {BOLD}{CYAN}{display}{RESET} {DIM}│{RESET}"));
+            } else {
+                out.push_str(&format!(" {display} {DIM}│{RESET}"));
+            }
+        }
+        out.push('\n');
+
+        // Separator after header: ├──────┼──────┤
+        if row_idx == 0 {
+            out.push_str(&format!("{DIM}├"));
+            for (i, width) in col_widths.iter().enumerate() {
+                for _ in 0..*width + 2 { out.push('─'); }
+                if i + 1 < num_cols { out.push('┼'); } else { out.push('┤'); }
+            }
+            out.push_str(&format!("{RESET}\n"));
+        }
+    }
+
+    // Bottom border: ╰──────┴──────╯
+    out.push_str(&format!("{DIM}╰"));
+    for (i, width) in col_widths.iter().enumerate() {
+        for _ in 0..*width + 2 { out.push('─'); }
+        if i + 1 < num_cols { out.push('┴'); } else { out.push('╯'); }
+    }
+    out.push_str(&format!("{RESET}\n"));
+
+    out.push('\n'); // spacing after table
+    out
+}
+
+/// Split text into table and non-table sections, render tables inline.
+fn render_text_with_tables(text: &str, md: &mut MarkdownRenderer, md_out: &mut String, is_streaming: bool, max_width: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut non_table_buf = String::new();
+
+    while i < lines.len() {
+        if is_table_line(lines[i]) {
+            // Flush non-table text through markdown renderer
+            if !non_table_buf.is_empty() {
+                *md = MarkdownRenderer::new();
+                md_out.clear();
+                md.feed(&non_table_buf, md_out);
+                if is_streaming { md.flush_streaming(md_out); } else { md.flush(md_out); }
+                out.push_str(md_out);
+                non_table_buf.clear();
+                // Ensure table starts on its own line
+                if !out.ends_with('\n') { out.push('\n'); }
+            }
+
+            // Collect consecutive table lines
+            let start = i;
+            while i < lines.len() && is_table_line(lines[i]) {
+                i += 1;
+            }
+            let table_lines = &lines[start..i];
+            out.push_str(&render_table(table_lines, max_width));
+        } else {
+            if !non_table_buf.is_empty() { non_table_buf.push('\n'); }
+            non_table_buf.push_str(lines[i]);
+            i += 1;
+        }
+    }
+
+    // Flush remaining non-table text
+    if !non_table_buf.is_empty() {
+        *md = MarkdownRenderer::new();
+        md_out.clear();
+        md.feed(&non_table_buf, md_out);
+        if is_streaming { md.flush_streaming(md_out); } else { md.flush(md_out); }
+        out.push_str(md_out);
+    }
+
     out
 }
 
@@ -947,13 +1134,13 @@ fn wrap_chat_line(line: &ChatLine, width: usize, md: &mut MarkdownRenderer, md_o
                 let settled_count = fades.iter().position(|&f| f > 0).unwrap_or(fades.len()).min(char_count);
 
                 if settled_count >= char_count {
-                    let rendered = render_content_with_code(clean, md, md_out, is_streaming);
+                    let rendered = render_content_with_code(clean, md, md_out, is_streaming, width);
                     let prefix = format!("  {BOLD}●{RESET} ");
                     wrap_styled_with_prefix(&prefix, "    ", rendered.trim_start(), width)
                 } else {
                     // Settled portion: render with code block support
                     let settled: String = clean.chars().take(settled_count).collect();
-                    let rendered = render_content_with_code(&settled, md, md_out, is_streaming);
+                    let rendered = render_content_with_code(&settled, md, md_out, is_streaming, width);
                     let mut combined = rendered.trim_start().to_string();
                     for (i, ch) in clean.chars().skip(settled_count).enumerate() {
                         let fade_val = fades.get(settled_count + i).copied().unwrap_or(0);
@@ -969,7 +1156,7 @@ fn wrap_chat_line(line: &ChatLine, width: usize, md: &mut MarkdownRenderer, md_o
                 }
             } else {
                 // No fade: full rendering with code block support
-                let rendered = render_content_with_code(clean, md, md_out, is_streaming);
+                let rendered = render_content_with_code(clean, md, md_out, is_streaming, width);
                 let prefix = format!("  {BOLD}●{RESET} ");
                 wrap_styled_with_prefix(&prefix, "    ", rendered.trim_start(), width)
             }

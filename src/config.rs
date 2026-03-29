@@ -140,11 +140,13 @@ pub fn fetch_models(api_url: &str, api_key: &str) -> Result<Vec<ModelInfo>, Stri
 
 #[derive(Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
     pub llm: LlmConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct AgentConfig {
     #[serde(default = "default_name")]
     pub name: String,
@@ -161,7 +163,7 @@ fn default_system_prompt() -> String {
     "You are a helpful autonomous assistant with access to tools.\nBe concise. Only run commands when needed. Think step by step.".into()
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct LlmConfig {
     #[serde(default)]
     pub api_url: String,

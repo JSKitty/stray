@@ -1,6 +1,6 @@
 [package]
 name = "stray"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "A living AI companion — autonomous, sovereign, with a heartbeat"
 license = "AGPL-3.0-only"
