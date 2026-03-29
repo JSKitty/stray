@@ -945,12 +945,13 @@ fn render_table(table_lines: &[&str], max_width: usize) -> String {
     let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if num_cols == 0 { return String::new(); }
 
-    // Calculate natural column widths (max content width per column)
+    // Calculate natural column widths using display width (emoji = 2 cols)
     let mut col_widths: Vec<usize> = vec![0; num_cols];
     for row in &rows {
         for (i, cell) in row.iter().enumerate() {
             if i < num_cols {
-                col_widths[i] = col_widths[i].max(cell.chars().count());
+                let w: usize = cell.chars().map(char_display_width).sum();
+                col_widths[i] = col_widths[i].max(w);
             }
         }
     }
@@ -975,7 +976,7 @@ fn render_table(table_lines: &[&str], max_width: usize) -> String {
 
     let mut out = String::from("\n"); // spacing before table
 
-    // Render a cell with markdown and pad/truncate to width
+    // Render a cell with markdown and pad/truncate to display width
     let render_cell = |cell_raw: &str, width: usize| -> String {
         let mut cell_md = MarkdownRenderer::new();
         let mut cell_out = String::new();
@@ -983,7 +984,15 @@ fn render_table(table_lines: &[&str], max_width: usize) -> String {
         cell_md.flush(&mut cell_out);
         let vis_width = strip_ansi_width(&cell_out);
         if vis_width > width {
-            let truncated: String = cell_raw.chars().take(width - 1).collect();
+            // Truncate by display width, not char count
+            let mut truncated = String::new();
+            let mut w = 0;
+            for ch in cell_raw.chars() {
+                let cw = char_display_width(ch);
+                if w + cw >= width { break; }
+                truncated.push(ch);
+                w += cw;
+            }
             let mut trunc_md = MarkdownRenderer::new();
             let mut trunc_out = String::new();
             trunc_md.feed(&truncated, &mut trunc_out);
@@ -1285,26 +1294,9 @@ fn write_padded_line(buf: &mut String, content: &str, _width: usize) {
 
 /// Display width of a single character (1 for most, 2 for wide/emoji)
 pub fn char_display_width(ch: char) -> usize {
-    let cp = ch as u32;
-    // Wide characters: CJK, emoji, fullwidth forms
-    if (0x1100..=0x115F).contains(&cp)     // Hangul Jamo
-        || (0x2E80..=0x303E).contains(&cp) // CJK Radicals
-        || (0x3040..=0x33BF).contains(&cp) // Hiragana, Katakana, CJK
-        || (0x3400..=0x4DBF).contains(&cp) // CJK Extension A
-        || (0x4E00..=0x9FFF).contains(&cp) // CJK Unified
-        || (0xA000..=0xA4CF).contains(&cp) // Yi
-        || (0xAC00..=0xD7AF).contains(&cp) // Hangul Syllables
-        || (0xF900..=0xFAFF).contains(&cp) // CJK Compatibility
-        || (0xFE30..=0xFE6F).contains(&cp) // CJK Forms
-        || (0xFF01..=0xFF60).contains(&cp) // Fullwidth Forms
-        || (0xFFE0..=0xFFE6).contains(&cp) // Fullwidth Signs
-        || (0x1F000..=0x1FBFF).contains(&cp) // Emoji & symbols
-        || (0x20000..=0x2FA1F).contains(&cp) // CJK Extension B+
-    {
-        2
-    } else {
-        1
-    }
+    use unicode_width::UnicodeWidthChar;
+    // UnicodeWidthChar returns None for control chars (width 0)
+    ch.width().unwrap_or(0)
 }
 
 /// Count the visible display width of a string (strip ANSI escape codes, handle wide chars)

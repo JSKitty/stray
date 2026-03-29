@@ -56,6 +56,37 @@ impl MarkdownRenderer {
     }
 
     pub fn feed(&mut self, text: &str, out: &mut String) {
+        // Process headers line by line, then feed remaining inline markdown
+        let mut lines = text.split('\n').peekable();
+        let mut first = true;
+        while let Some(line) = lines.next() {
+            if !first {
+                self.print_char('\n', out);
+            }
+            first = false;
+
+            // Check for header: # ## ### #### etc.
+            let trimmed = line.trim_start();
+            let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+            if hashes > 0 && hashes <= 6 && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+                let header_text = &trimmed[hashes + 1..];
+                self.emit_newlines(out);
+                let _ = write!(out, "{BOLD}{}{RESET}{}", self.base_style, self.base_style);
+                // Feed header content through inline markdown (for bold/italic/code inside headers)
+                let saved_bold = self.bold;
+                self.bold = true;
+                self.apply_style(out);
+                self.feed_inline(header_text, out);
+                self.bold = saved_bold;
+                self.apply_style(out);
+                continue;
+            }
+
+            self.feed_inline(line, out);
+        }
+    }
+
+    fn feed_inline(&mut self, text: &str, out: &mut String) {
         for ch in text.chars() {
             // Inside inline code: only backtick is special
             if self.code {
