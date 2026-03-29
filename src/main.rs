@@ -1,6 +1,8 @@
 mod config;
 mod departments;
 mod event;
+#[cfg(feature = "link")]
+mod link;
 mod formats;
 mod highlight;
 mod markdown;
@@ -187,6 +189,28 @@ pub(crate) fn call_llm(
                     Event::Key(key) => {
                         if let Some(ref mut s) = state {
                             handle_agent_key(key, s, messages, queued_messages);
+                        }
+                    }
+                    #[cfg(feature = "link")]
+                    Event::Link(link_event) => {
+                        match link_event {
+                            link::LinkEvent::IncomingMessage { from_name, content, .. } => {
+                                queued_messages.push(format!("[Link] Remote peer '{from_name}' sent: {content}"));
+                                if let Some(ref mut s) = state {
+                                    s.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                        content: format!("{CYAN}[link]{RESET} from {BOLD}{from_name}{RESET}: {content}") });
+                                }
+                            }
+                            link::LinkEvent::PeerIdentified { endpoint_id, name, .. } => {
+                                let mut peers = link::load_peers();
+                                if !peers.iter().any(|p| p.endpoint_id == endpoint_id) {
+                                    peers.push(link::PeerEntry {
+                                        name, endpoint_id, trusted: true, last_seen: 0,
+                                    });
+                                    link::save_peers(&peers);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -594,6 +618,14 @@ fn run_heartbeat(
                                             }
                                             Event::Key(key) => {
                                                 handle_agent_key(key, state, messages, queued_messages);
+                                            }
+                                            #[cfg(feature = "link")]
+                                            Event::Link(link_event) => {
+                                                if let link::LinkEvent::IncomingMessage { from_name, content, .. } = link_event {
+                                                    queued_messages.push(format!("[Link] Remote peer '{from_name}' sent: {content}"));
+                                                    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                        content: format!("{CYAN}[link]{RESET} from {BOLD}{from_name}{RESET}: {content}") });
+                                                }
                                             }
                                         }
                                     }
@@ -1567,6 +1599,11 @@ fn main() {
             println!("stray {}", config::VERSION);
             return;
         }
+        #[cfg(feature = "link")]
+        if args.iter().any(|a| a == "--link") {
+            println!("{}", link::get_endpoint_id());
+            return;
+        }
         if args.len() >= 3 && args[1] == "--department" {
             departments::run_headless(&args[2]);
             return;
@@ -1597,6 +1634,13 @@ fn main() {
     let vision_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llm.vision));
     // Shared LLM config for DepartmentTool (snapshot at department creation time)
     let shared_llm = std::sync::Arc::new(std::sync::Mutex::new(config.llm.clone()));
+
+    // Pre-create Link command channel for LinkTool (manager starts later with event_tx)
+    #[cfg(feature = "link")]
+    let (link_cmd_tx, link_cmd_rx) = std::sync::mpsc::channel::<link::LinkCommand>();
+    #[cfg(feature = "link")]
+    let link_endpoint_id = link::get_endpoint_id();
+
     let registry = {
         let mut r = ToolRegistry::new();
         r.add(Box::new(tools::BashTool));
@@ -1604,6 +1648,12 @@ fn main() {
         r.add(Box::new(tools::WriteTool));
         r.add(Box::new(tools::EditTool));
         r.add(Box::new(departments::DepartmentTool::new(shared_llm.clone())));
+        #[cfg(feature = "link")]
+        r.add(Box::new(link::LinkTool::new(
+            link_cmd_tx.clone(),
+            link_endpoint_id.clone(),
+            config.agent.name.clone(),
+        )));
         r
     };
 
@@ -1665,10 +1715,16 @@ fn main() {
     };
 
     // Event channels (input thread + tick thread + resize watcher)
-    let event_rx = event::setup_event_channels();
+    let (event_tx, event_rx) = event::setup_event_channels();
 
     // Filesystem watcher for department changes (instant notifications)
     start_department_watcher();
+
+    // Stray Link — P2P agent mesh (feature-gated)
+    #[cfg(feature = "link")]
+    let link_manager = link::LinkManager::start(
+        link_cmd_rx, link_cmd_tx, event_tx, config.agent.name.clone()
+    );
 
     // Signal safety net — restores terminal on SIGINT/SIGTERM even if event loop is stuck
     event::setup_signal_handlers();
@@ -2163,6 +2219,42 @@ fn main() {
                         }
                     }
                 }
+                #[cfg(feature = "link")]
+                Ok(Event::Link(link_event)) => {
+                    match link_event {
+                        link::LinkEvent::IncomingMessage { from_name, content, is_result, .. } => {
+                            let label = if is_result { "result" } else { "task" };
+                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                content: format!("{CYAN}[link]{RESET} {label} from {BOLD}{from_name}{RESET}: {content}") });
+                            // Trigger agent with the message
+                            let notification = format!("[Link] Remote peer '{from_name}' sent: {content}");
+                            dept_notification = Some(vec![notification]);
+                            state.render();
+                            break 'prompt;
+                        }
+                        link::LinkEvent::PeerIdentified { endpoint_id, name, version } => {
+                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                content: format!("{CYAN}[link]{RESET} Paired with {BOLD}{name}{RESET} (v{version})") });
+                            // Auto-trust
+                            let mut peers = link::load_peers();
+                            if !peers.iter().any(|p| p.endpoint_id == endpoint_id) {
+                                peers.push(link::PeerEntry {
+                                    name, endpoint_id, trusted: true, last_seen: 0,
+                                });
+                                link::save_peers(&peers);
+                            }
+                            state.render();
+                        }
+                        link::LinkEvent::Error(e) => {
+                            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                content: format!("[link] {e}") });
+                            state.render();
+                        }
+                        link::LinkEvent::Ready => {
+                            // Link endpoint is online — could show in header
+                        }
+                    }
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // Check if deadline passed (heartbeat)
                 }
@@ -2479,6 +2571,66 @@ fn main() {
                                 state.push_chat(ChatLine { kind: ChatLineKind::Error,
                                     content: format!("Unknown role: {role_key}") });
                             }
+                        }
+                    }
+                    "/link" => {
+                        #[cfg(feature = "link")]
+                        {
+                            if args.is_empty() {
+                                // Show node ID and peer list
+                                let id = &link_manager.endpoint_id();
+                                let id_short = if id.len() > 16 { &id[..16] } else { id };
+                                let peers = link::load_peers();
+                                let mut info = format!("{CYAN}Stray Link{RESET}\n  Node ID: {BOLD}{id_short}...{RESET}\n  Full ID: {DIM}{id}{RESET}\n");
+                                if peers.is_empty() {
+                                    info.push_str(&format!("\n  {DIM}No peers — use /link connect <endpoint-id> to pair{RESET}"));
+                                } else {
+                                    info.push_str("\n  Peers:\n");
+                                    for p in &peers {
+                                        let trust = if p.trusted { format!("{CYAN}trusted{RESET}") } else { format!("{YELLOW}untrusted{RESET}") };
+                                        let pid_short = if p.endpoint_id.len() > 16 { &p.endpoint_id[..16] } else { &p.endpoint_id };
+                                        info.push_str(&format!("    {BOLD}{}{RESET} — {trust} ({DIM}{pid_short}...{RESET})\n", p.name));
+                                    }
+                                }
+                                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: info.trim_end().to_string() });
+                            } else {
+                                let sub_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                                match sub_parts[0] {
+                                    "connect" => {
+                                        let addr = sub_parts.get(1).copied().unwrap_or("");
+                                        if addr.is_empty() {
+                                            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                                content: "Usage: /link connect <endpoint-id>".into() });
+                                        } else {
+                                            link_manager.send_command(link::LinkCommand::Connect(addr.to_string()));
+                                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                content: format!("{DIM}Connecting to {addr}...{RESET}") });
+                                        }
+                                    }
+                                    "remove" => {
+                                        let name = sub_parts.get(1).copied().unwrap_or("");
+                                        let mut peers = link::load_peers();
+                                        if let Some(pos) = peers.iter().position(|p| p.name == name) {
+                                            peers.remove(pos);
+                                            link::save_peers(&peers);
+                                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                content: format!("Removed peer {BOLD}{name}{RESET}") });
+                                        } else {
+                                            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                                content: format!("Unknown peer: {name}") });
+                                        }
+                                    }
+                                    _ => {
+                                        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                            content: format!("{DIM}Usage: /link, /link connect <id>, /link remove <name>{RESET}") });
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "link"))]
+                        {
+                            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                content: "Link feature not compiled in".into() });
                         }
                     }
                     "/update" => {

@@ -9,10 +9,12 @@ pub enum Event {
     Key(Key),
     Resize,
     Tick,
+    #[cfg(feature = "link")]
+    Link(crate::link::LinkEvent),
 }
 
-/// Spawn all event-producing threads. Returns the event receiver.
-pub fn setup_event_channels() -> Receiver<Event> {
+/// Spawn all event-producing threads. Returns the event sender (for link thread) and receiver.
+pub fn setup_event_channels() -> (Sender<Event>, Receiver<Event>) {
     let (tx, rx) = mpsc::channel();
 
     // Input thread (raw terminal, sends Key events — never touches stdout)
@@ -61,10 +63,10 @@ pub fn setup_event_channels() -> Receiver<Event> {
     });
 
     // Resize watcher (SIGWINCH → pipe → event)
-    let tx_resize = tx;
+    let tx_resize = tx.clone();
     setup_resize_watcher(tx_resize);
 
-    rx
+    (tx, rx)
 }
 
 fn setup_resize_watcher(tx: Sender<Event>) {

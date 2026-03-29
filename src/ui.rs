@@ -152,6 +152,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/roles", "Manage agent roles"),
     ("/departments", "View department statuses"),
     ("/department", "Create a new department"),
+    ("/link", "Manage P2P peer connections"),
     ("/update", "Check for updates"),
     ("/clear", "Clear conversation history"),
     ("/exit", "Exit stray"),

@@ -381,6 +381,13 @@ fn strip_ansi(s: &str) -> String {
     result
 }
 
+/// Known providers for the setup wizard: (name, url, default_key)
+const WIZARD_PROVIDERS: &[(&str, &str, &str)] = &[
+    ("LMStudio", "http://127.0.0.1:1234/v1/chat/completions", "lm-studio"),
+    ("PPQ", "https://api.ppq.ai/v1/chat/completions", ""),
+    ("Other", "", ""),
+];
+
 fn run_setup_wizard() -> LoadedConfig {
     let _orig = enable_raw_mode();
 
@@ -394,32 +401,48 @@ fn run_setup_wizard() -> LoadedConfig {
     println!("  {DIM}           v{VERSION} · first run setup{RESET}");
     println!();
 
-    // Probe LMStudio
-    print!("  Checking for LMStudio...");
-    let _ = io::stdout().flush();
+    // Check for LMStudio (auto-detect, silent if not found)
     let lmstudio = probe_lmstudio();
-    if lmstudio {
-        println!(" {CYAN}found!{RESET}");
-    } else {
-        println!(" {DIM}not found{RESET}");
-    }
-    println!();
 
-    // API URL
-    let default_url = if lmstudio {
-        "http://127.0.0.1:1234/v1/chat/completions"
+    // Provider selection
+    let (api_url, api_key) = if lmstudio {
+        println!("  {CYAN}LMStudio detected!{RESET} Using local API.\n");
+        (
+            "http://127.0.0.1:1234/v1/chat/completions".to_string(),
+            "lm-studio".to_string(),
+        )
     } else {
-        ""
-    };
-    let api_url = wizard_prompt("API URL", default_url);
+        println!("  {DIM}Choose a provider:{RESET}");
+        for (i, (name, _, _)) in WIZARD_PROVIDERS.iter().enumerate() {
+            if i == 0 {
+                println!("   {CYAN}>{RESET} {DIM}{}){RESET} {BOLD}{name}{RESET}", i + 1);
+            } else {
+                println!("     {DIM}{}){RESET} {name}", i + 1);
+            }
+        }
+        println!();
+        let choice = wizard_prompt("Pick", "1");
+        let idx = choice.parse::<usize>().unwrap_or(1).saturating_sub(1)
+            .min(WIZARD_PROVIDERS.len().saturating_sub(1));
+        let (prov_name, prov_url, prov_key) = WIZARD_PROVIDERS[idx];
 
-    // API Key
-    let default_key = if lmstudio && api_url.contains("127.0.0.1:1234") {
-        "lm-studio"
-    } else {
-        ""
+        let url = if prov_url.is_empty() {
+            // Custom provider — ask for URL
+            wizard_prompt("API URL", "")
+        } else {
+            println!("  {DIM}API URL:{RESET} {prov_url}");
+            prov_url.to_string()
+        };
+
+        let key = if !prov_key.is_empty() {
+            prov_key.to_string()
+        } else {
+            // Ask for API key
+            wizard_prompt("API Key", "")
+        };
+
+        (url, key)
     };
-    let api_key = wizard_prompt("API Key", default_key);
 
     // Fetch models (uses LMStudio native API if available)
     print!("\n  {DIM}Fetching models...{RESET}");
