@@ -146,18 +146,28 @@ pub struct Config {
 
 #[derive(Deserialize)]
 pub struct AgentConfig {
+    #[serde(default = "default_name")]
     pub name: String,
+    #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
-    #[serde(alias = "ping_interval")]
+    #[serde(default, alias = "ping_interval")]
     pub heartbeat: u64,
     #[serde(default = "default_compact_at")]
     pub compact_at: usize,
 }
 
+fn default_name() -> String { "Stray".into() }
+fn default_system_prompt() -> String {
+    "You are a helpful autonomous assistant with access to tools.\nBe concise. Only run commands when needed. Think step by step.".into()
+}
+
 #[derive(Clone, Deserialize)]
 pub struct LlmConfig {
+    #[serde(default)]
     pub api_url: String,
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
     pub model: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
