@@ -201,14 +201,18 @@ pub(crate) fn call_llm(
                                         content: format!("{CYAN}[link]{RESET} from {BOLD}{from_name}{RESET}: {content}") });
                                 }
                             }
-                            link::LinkEvent::PeerIdentified { endpoint_id, name, .. } => {
+                            link::LinkEvent::PeerIdentified { endpoint_id, name, addr, .. } => {
                                 let mut peers = link::load_peers();
-                                if !peers.iter().any(|p| p.endpoint_id == endpoint_id) {
+                                let addr_str = addr.unwrap_or_default();
+                                if let Some(existing) = peers.iter_mut().find(|p| p.endpoint_id == endpoint_id) {
+                                    existing.name = name;
+                                    if !addr_str.is_empty() { existing.addr = addr_str; }
+                                } else {
                                     peers.push(link::PeerEntry {
-                                        name, endpoint_id, trusted: true, last_seen: 0,
+                                        name, endpoint_id, trusted: true, last_seen: 0, addr: addr_str,
                                     });
-                                    link::save_peers(&peers);
                                 }
+                                link::save_peers(&peers);
                             }
                             _ => {}
                         }
@@ -901,6 +905,40 @@ fn poll_department_completions(state: &mut AppState) -> Vec<String> {
     notifications
 }
 
+/// Show help for a command's sub-commands.
+fn show_subcommand_help(state: &mut AppState, cmd: &str) {
+    let help = match cmd {
+        #[cfg(feature = "link")]
+        "link" => {
+            show_link_help(state);
+            return;
+        }
+        "department" => format!(
+            "{CYAN}/department{RESET} — Create a new department\n\
+             {DIM}Usage: /department <name> [role:<key>] <task description>{RESET}"
+        ),
+        "departments" => format!(
+            "{CYAN}/departments{RESET} — View and manage departments\n\
+             {DIM}Opens the department selector. Use arrow keys to navigate.{RESET}"
+        ),
+        _ => return,
+    };
+    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: help });
+}
+
+#[cfg(feature = "link")]
+fn show_link_help(state: &mut AppState) {
+    let help = format!(
+        "{CYAN}Stray Link{RESET} — P2P agent mesh\n\n\
+         {CYAN}/link{RESET}                        {DIM}Show your Node ID and peer list{RESET}\n\
+         {CYAN}/link connect{RESET} <endpoint-id>  {DIM}Pair with a remote Stray{RESET}\n\
+         {CYAN}/link send{RESET} <peer> <message>   {DIM}Send a message to a peer{RESET}\n\
+         {CYAN}/link remove{RESET} <peer-name>      {DIM}Remove a trusted peer{RESET}\n\n\
+         {DIM}Stray's AI can also use the link tool autonomously.{RESET}"
+    );
+    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: help });
+}
+
 fn open_departments_selector(state: &mut AppState) {
     if let Some(mgr) = departments::DepartmentManager::new() {
         let depts = mgr.list();
@@ -1481,9 +1519,14 @@ fn fmt_tokens(n: usize) -> String {
     else { format!("{n}") }
 }
 
-fn format_context_display(messages: &[Message], config: &Config) -> String {
-    let total = estimate_tokens(messages);
+fn format_context_display(messages: &[Message], config: &Config, api_tokens: Option<usize>) -> String {
+    let estimated = estimate_tokens(messages);
+    let total = api_tokens.unwrap_or(estimated);
     let system_tokens = if !messages.is_empty() { estimate_tokens(&messages[0..1]) } else { 0 };
+    // Scale system tokens proportionally if using API count
+    let system_tokens = if api_tokens.is_some() && estimated > 0 {
+        (system_tokens as f64 / estimated as f64 * total as f64) as usize
+    } else { system_tokens };
     let msg_tokens = total.saturating_sub(system_tokens);
     let msg_count = messages.len().saturating_sub(1);
     let limit = config.agent.compact_at;
@@ -1731,6 +1774,7 @@ fn main() {
 
     // Ctrl+C double-tap state
     let mut last_ctrlc: u64 = 0;
+    let mut last_api_tokens: Option<usize> = None;
 
 
     // --- Main event loop ---
@@ -2232,17 +2276,21 @@ fn main() {
                             state.render();
                             break 'prompt;
                         }
-                        link::LinkEvent::PeerIdentified { endpoint_id, name, version } => {
+                        link::LinkEvent::PeerIdentified { endpoint_id, name, version, addr } => {
                             state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
                                 content: format!("{CYAN}[link]{RESET} Paired with {BOLD}{name}{RESET} (v{version})") });
-                            // Auto-trust
+                            // Auto-trust + save address for reconnection
                             let mut peers = link::load_peers();
-                            if !peers.iter().any(|p| p.endpoint_id == endpoint_id) {
+                            let addr_str = addr.unwrap_or_default();
+                            if let Some(existing) = peers.iter_mut().find(|p| p.endpoint_id == endpoint_id) {
+                                existing.name = name;
+                                if !addr_str.is_empty() { existing.addr = addr_str; }
+                            } else {
                                 peers.push(link::PeerEntry {
-                                    name, endpoint_id, trusted: true, last_seen: 0,
+                                    name, endpoint_id, trusted: true, last_seen: 0, addr: addr_str,
                                 });
-                                link::save_peers(&peers);
                             }
+                            link::save_peers(&peers);
                             state.render();
                         }
                         link::LinkEvent::Error(e) => {
@@ -2380,13 +2428,20 @@ fn main() {
 
                 match cmd {
                     "/help" => {
-                        let mut help = String::new();
-                        let cmds: Vec<_> = SLASH_COMMANDS.iter().filter(|(n, _)| *n != "/help").collect();
-                        let name_w = cmds.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-                        for (name, desc) in cmds {
-                            help.push_str(&format!("  {CYAN}{name:<name_w$}{RESET}  {DIM}{desc}{RESET}\n"));
+                        if !args.is_empty() {
+                            // Sub-command help: /help link, /help department, etc.
+                            let sub = args.trim().trim_start_matches('/');
+                            show_subcommand_help(&mut state, sub);
+                        } else {
+                            let mut help = String::new();
+                            let cmds: Vec<_> = SLASH_COMMANDS.iter().filter(|(n, _)| *n != "/help").collect();
+                            let name_w = cmds.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+                            for (name, desc) in cmds {
+                                help.push_str(&format!("  {CYAN}{name:<name_w$}{RESET}  {DIM}{desc}{RESET}\n"));
+                            }
+                            help.push_str(&format!("\n  {DIM}/help <command> for detailed usage{RESET}"));
+                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: help.trim_end().to_string() });
                         }
-                        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: help.trim_end().to_string() });
                     }
                     "/model" => {
                         if args.is_empty() {
@@ -2499,7 +2554,7 @@ fn main() {
                     "/context" => {
                         state.push_chat(ChatLine {
                             kind: ChatLineKind::SystemInfo,
-                            content: format_context_display(&messages, &config),
+                            content: format_context_display(&messages, &config, last_api_tokens),
                         });
                     }
                     "/compact" => {
@@ -2608,7 +2663,7 @@ fn main() {
                                         }
                                     }
                                     "remove" => {
-                                        let name = sub_parts.get(1).copied().unwrap_or("");
+                                        let name = sub_parts.get(1).copied().unwrap_or("").trim();
                                         let mut peers = link::load_peers();
                                         if let Some(pos) = peers.iter().position(|p| p.name == name) {
                                             peers.remove(pos);
@@ -2620,9 +2675,49 @@ fn main() {
                                                 content: format!("Unknown peer: {name}") });
                                         }
                                     }
+                                    "send" => {
+                                        // /link send <peer> <message>
+                                        // Peer names can contain spaces — match against known peers
+                                        let rest = sub_parts.get(1).copied().unwrap_or("");
+                                        let peers = link::load_peers();
+                                        let matched = peers.iter().find(|p| rest.starts_with(&p.name));
+                                        let (peer_name, msg_text) = if let Some(p) = &matched {
+                                            let msg = rest[p.name.len()..].trim_start();
+                                            (p.name.as_str(), msg)
+                                        } else {
+                                            // Fallback: split on first space
+                                            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                                            (parts.first().copied().unwrap_or(""), parts.get(1).copied().unwrap_or(""))
+                                        };
+                                        if peer_name.is_empty() || msg_text.is_empty() {
+                                            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                                content: "Usage: /link send <peer-name> <message>".into() });
+                                        } else {
+                                            if let Some(p) = peers.iter().find(|p| p.name == peer_name) {
+                                                let addr = if p.addr.is_empty() { None } else { Some(p.addr.clone()) };
+                                                link_manager.send_command(link::LinkCommand::Send {
+                                                    endpoint_id: p.endpoint_id.clone(),
+                                                    addr,
+                                                    message: link::WireMessage::Task {
+                                                        from_name: config.agent.name.clone(),
+                                                        content: msg_text.to_string(),
+                                                    },
+                                                });
+                                                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                                    content: format!("Sent to {BOLD}{peer_name}{RESET}: {msg_text}") });
+                                                // Inject into Stray's context so the AI knows what happened
+                                                messages.push(Message {
+                                                    role: Role::User,
+                                                    content: format!("[{}] [Operator sent a message to Stray Link peer '{peer_name}']: {msg_text}", timestamp()),
+                                                });
+                                            } else {
+                                                state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                                    content: format!("Unknown peer: {peer_name}") });
+                                            }
+                                        }
+                                    }
                                     _ => {
-                                        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                            content: format!("{DIM}Usage: /link, /link connect <id>, /link remove <name>{RESET}") });
+                                        show_link_help(&mut state);
                                     }
                                 }
                             }
@@ -2670,6 +2765,7 @@ fn main() {
                 &mut messages, vec![text], &mut state, &event_rx, &mut queued,
             );
             queued.extend(new_queued);
+            if api_tokens.is_some() { last_api_tokens = api_tokens; }
 
             let token_count = api_tokens.unwrap_or_else(|| estimate_tokens(&messages));
             if token_count >= config.agent.compact_at {

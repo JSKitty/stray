@@ -32,6 +32,7 @@ pub enum LinkEvent {
         endpoint_id: String,
         name: String,
         version: String,
+        addr: Option<String>, // serialized EndpointAddr for reconnection
     },
     /// Error from the Iroh thread
     Error(String),
@@ -44,7 +45,7 @@ pub enum LinkCommand {
     /// Connect to a peer by endpoint address string
     Connect(String),
     /// Send a message to a connected peer
-    Send { endpoint_id: String, message: WireMessage },
+    Send { endpoint_id: String, addr: Option<String>, message: WireMessage },
     /// Shut down the endpoint
     Shutdown,
 }
@@ -74,6 +75,9 @@ pub struct PeerEntry {
     pub trusted: bool,
     #[serde(default)]
     pub last_seen: u64,
+    /// Serialized EndpointAddr JSON for reconnection (includes relay + direct addrs)
+    #[serde(default)]
+    pub addr: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -268,11 +272,11 @@ async fn iroh_main(
                     handle_connect(ep, &addr_str, evt, name).await;
                 });
             }
-            Ok(LinkCommand::Send { endpoint_id, message }) => {
+            Ok(LinkCommand::Send { endpoint_id, addr, message }) => {
                 let ep = endpoint.clone();
                 let evt = event_tx.clone();
                 tokio::spawn(async move {
-                    handle_send(ep, &endpoint_id, message, evt).await;
+                    handle_send(ep, &endpoint_id, addr, message, evt).await;
                 });
             }
             Ok(LinkCommand::Shutdown) => break,
@@ -340,10 +344,13 @@ async fn handle_incoming(
                     version: config::VERSION.to_string(),
                 };
                 let _ = write_message(send, &pong).await;
+                // Capture remote address for reconnection
+                let remote_addr: Option<String> = None; // will be populated from remote_info on connect
                 let _ = event_tx.send(Event::Link(LinkEvent::PeerIdentified {
                     endpoint_id: remote_id.clone(),
                     name: name.clone(),
                     version: version.clone(),
+                    addr: remote_addr,
                 }));
             }
             WireMessage::Task { from_name, content } => {
@@ -449,10 +456,12 @@ async fn handle_connect(
     // Wait for Pong
     match read_message(recv).await {
         Ok(WireMessage::Pong { name, version }) => {
+            let remote_addr: Option<String> = None; // populated via remote_info on next send
             let _ = event_tx.send(Event::Link(LinkEvent::PeerIdentified {
                 endpoint_id: conn.remote_id().to_string(),
                 name,
                 version,
+                addr: remote_addr,
             }));
         }
         Ok(_) => {
@@ -471,6 +480,7 @@ async fn handle_connect(
 async fn handle_send(
     endpoint: iroh::Endpoint,
     endpoint_id_str: &str,
+    addr_json: Option<String>,
     message: WireMessage,
     event_tx: Sender<Event>,
 ) {
@@ -483,13 +493,35 @@ async fn handle_send(
             return;
         }
     };
-    let addr = iroh::EndpointAddr::new(eid);
 
-    let conn = match endpoint.connect(addr, STRAY_ALPN).await {
-        Ok(c) => c,
-        Err(e) => {
+    // Try stored address first, then check Iroh's route cache, fall back to bare ID
+    let addr = if let Some(ref json) = addr_json {
+        serde_json::from_str::<iroh::EndpointAddr>(json)
+            .unwrap_or_else(|_| iroh::EndpointAddr::new(eid))
+    } else if let Some(info) = endpoint.remote_info(eid).await {
+        // Build EndpointAddr from cached remote info
+        let addrs: Vec<iroh::TransportAddr> = info.addrs()
+            .map(|a| a.addr().clone())
+            .collect();
+        iroh::EndpointAddr::from_parts(eid, addrs)
+    } else {
+        iroh::EndpointAddr::new(eid)
+    };
+
+    let conn = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        endpoint.connect(addr, STRAY_ALPN)
+    ).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             let _ = event_tx.send(Event::Link(LinkEvent::Error(
                 format!("Send failed: {e}")
+            )));
+            return;
+        }
+        Err(_) => {
+            let _ = event_tx.send(Event::Link(LinkEvent::Error(
+                "Send failed: connection timed out (10s)".into()
             )));
             return;
         }
@@ -604,8 +636,10 @@ impl Tool for LinkTool {
                             from_name: self.agent_name.clone(),
                             content: message,
                         };
+                        let addr = if p.addr.is_empty() { None } else { Some(p.addr.clone()) };
                         let _ = self.cmd_tx.send(LinkCommand::Send {
                             endpoint_id: p.endpoint_id.clone(),
+                            addr,
                             message: msg,
                         });
                         format!("[Task sent to '{peer_name}' — you will be notified when they respond]")

@@ -205,6 +205,70 @@ fn param_suggestion(cmd: &str, partial: &str) -> String {
             }
             String::new()
         }
+        "/link" => {
+            // Sub-command autocomplete: connect, send, remove, help
+            let link_subs = ["connect ", "send ", "remove "];
+            // Check if we're in a sub-command or still typing the sub-command
+            if let Some(space_pos) = partial.find(' ') {
+                let sub = &partial[..space_pos];
+                let sub_param = &partial[space_pos + 1..];
+                if sub_param.is_empty() { return String::new(); }
+                match sub {
+                    // Autocomplete peer names for send and remove
+                    "send" | "remove" => {
+                        #[cfg(feature = "link")]
+                        {
+                            let peers = crate::link::load_peers();
+                            for p in &peers {
+                                if p.name.starts_with(sub_param) && p.name.len() > sub_param.len() {
+                                    return p.name[sub_param.len()..].to_string();
+                                }
+                            }
+                        }
+                        String::new()
+                    }
+                    // Autocomplete peer IDs for connect
+                    "connect" => {
+                        #[cfg(feature = "link")]
+                        {
+                            let peers = crate::link::load_peers();
+                            for p in &peers {
+                                if p.endpoint_id.starts_with(sub_param) && p.endpoint_id.len() > sub_param.len() {
+                                    return p.endpoint_id[sub_param.len()..].to_string();
+                                }
+                            }
+                        }
+                        String::new()
+                    }
+                    _ => String::new(),
+                }
+            } else {
+                // Autocomplete the sub-command itself
+                for sub in &link_subs {
+                    if sub.starts_with(partial) && sub.len() > partial.len() {
+                        return sub[partial.len()..].to_string();
+                    }
+                }
+                String::new()
+            }
+        }
+        "/help" => {
+            // Autocomplete command names for /help <command>
+            let partial_with_slash = format!("/{partial}");
+            for (name, _) in SLASH_COMMANDS {
+                if name.starts_with(&partial_with_slash) && name.len() > partial_with_slash.len() {
+                    return name[partial_with_slash.len()..].to_string();
+                }
+            }
+            // Also match without the slash
+            for (name, _) in SLASH_COMMANDS {
+                let bare = name.trim_start_matches('/');
+                if bare.starts_with(partial) && bare.len() > partial.len() {
+                    return bare[partial.len()..].to_string();
+                }
+            }
+            String::new()
+        }
         _ => String::new(),
     }
 }
