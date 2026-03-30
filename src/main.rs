@@ -1231,16 +1231,36 @@ fn self_update(state: &mut AppState) {
             std::fs::Permissions::from_mode(0o755));
     }
 
-    // Atomic replace: rename new over old
-    if let Err(e) = std::fs::rename(&new_binary, &current_exe) {
-        // rename may fail across filesystems — fall back to copy
-        if let Err(e2) = std::fs::copy(&new_binary, &current_exe) {
+    // Replace binary: on Linux, can't overwrite a running executable.
+    // Strategy: copy new binary next to the target, delete old, rename new.
+    let target_dir = current_exe.parent().unwrap_or(std::path::Path::new("."));
+    let staged = target_dir.join(".stray-update");
+    if let Err(e) = std::fs::copy(&new_binary, &staged) {
+        state.stop_spinner();
+        state.push_chat(ChatLine { kind: ChatLineKind::Error,
+            content: format!("Failed to stage binary: {e}") });
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+    }
+    // Delete the running binary (Linux allows unlinking while running)
+    let _ = std::fs::remove_file(&current_exe);
+    // Rename staged file to target
+    if let Err(e) = std::fs::rename(&staged, &current_exe) {
+        // Last resort: copy (works if remove+rename both fail somehow)
+        if let Err(e2) = std::fs::copy(&staged, &current_exe) {
             state.stop_spinner();
             state.push_chat(ChatLine { kind: ChatLineKind::Error,
                 content: format!("Failed to replace binary: {e}, copy also failed: {e2}") });
             let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = std::fs::remove_file(&staged);
             return;
         }
+        let _ = std::fs::remove_file(&staged);
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
