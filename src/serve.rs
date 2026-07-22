@@ -541,6 +541,220 @@ fn handle_link_task(
 }
 
 // ---------------------------------------------------------------------------
+// Inbox — universal external event ingestion (headless-only)
+// ---------------------------------------------------------------------------
+
+/// Set by the inbox filesystem watcher; the loop rescans when true.
+static INBOX_CHANGED: AtomicBool = AtomicBool::new(true);
+
+fn start_inbox_watcher(dir: std::path::PathBuf) {
+    use notify::{RecursiveMode, Watcher};
+    std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(&dir);
+        let mut watcher = match notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
+            INBOX_CHANGED.store(true, Ordering::Relaxed);
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[serve/inbox] watcher failed to start: {e}");
+                return;
+            }
+        };
+        if watcher.watch(&dir, RecursiveMode::Recursive).is_err() {
+            eprintln!("[serve/inbox] cannot watch {}", dir.display());
+            return;
+        }
+        loop {
+            std::thread::park(); // keep the thread (and thus the watcher) alive
+        }
+    });
+}
+
+/// Debounce bookkeeping for settle-then-sweep.
+#[derive(Default)]
+struct InboxWatch {
+    pending_count: usize,
+    first_seen: Option<Instant>,
+    last_change: Option<Instant>,
+}
+
+/// Everything the daemon needs to ingest inbox events, bundled so the loop drives
+/// it with one call. Owns two registries: the trusted one (full agent tools at
+/// config trust) and the untrusted one (REPLY-ONLY — no system access at all).
+struct InboxRuntime {
+    root: std::path::PathBuf,
+    trusted_registry: ToolRegistry,
+    trusted_tools: Option<serde_json::Value>,
+    trusted_system: String,
+    untrusted_registry: ToolRegistry,
+    untrusted_tools: Option<serde_json::Value>,
+    untrusted_system: String,
+    reply_ctx: Arc<Mutex<crate::inbox::ReplyContext>>,
+    rate: crate::inbox::RateLimiter,
+    watch: InboxWatch,
+}
+
+impl InboxRuntime {
+    fn new(
+        config: &crate::config::Config,
+        shared_trust: Arc<Mutex<crate::trust::TrustLevel>>,
+        vision: Arc<AtomicBool>,
+        format: &dyn ModelFormat,
+        cwd: &str,
+    ) -> Option<Self> {
+        let root = crate::inbox::inbox_root()?;
+        let reply_ctx = Arc::new(Mutex::new(crate::inbox::ReplyContext::default()));
+
+        // Trusted digests: the agent's FULL toolset at its config trust + reply.
+        let mut trusted_registry = {
+            let base = ["bash", "read", "write", "edit"].map(String::from);
+            crate::tools::build_registry(&base, shared_trust, true, vision.clone())
+        };
+        trusted_registry.add(Box::new(crate::inbox::ReplyTool::new(reply_ctx.clone())));
+
+        // Untrusted digests: REPLY-ONLY. No system tools at all, so a hostile
+        // message can reason and reply but cannot touch the machine, read
+        // secrets, write files, or reach the network.
+        let mut untrusted_registry = {
+            let sealed = Arc::new(Mutex::new(crate::trust::TrustLevel::Sandboxed));
+            crate::tools::build_registry(&[], sealed, true, vision)
+        };
+        untrusted_registry.add(Box::new(crate::inbox::ReplyTool::new(reply_ctx.clone())));
+
+        let trusted_tools = format.format_tools(&trusted_registry);
+        let untrusted_tools = format.format_tools(&untrusted_registry);
+        let trusted_system = crate::build_system_prompt(config, format, &trusted_registry, cwd);
+        let untrusted_system = crate::build_system_prompt(config, format, &untrusted_registry, cwd);
+
+        for (name, s) in &config.inbox.sources {
+            if s.enabled {
+                let _ = std::fs::create_dir_all(root.join(name).join("new"));
+            }
+        }
+        crate::inbox::recover_stranded(&root, &config.inbox);
+        start_inbox_watcher(root.clone());
+
+        Some(InboxRuntime {
+            root,
+            trusted_registry,
+            trusted_tools,
+            trusted_system,
+            untrusted_registry,
+            untrusted_tools,
+            untrusted_system,
+            reply_ctx,
+            rate: crate::inbox::RateLimiter::default(),
+            watch: InboxWatch::default(),
+        })
+    }
+
+    /// Rescan, apply the settle/cap debounce, and sweep at most ONE batch per
+    /// call (so inbox activity can't starve Control/heartbeat). Returns a short
+    /// wait hint when events are pending but not yet settled.
+    fn tick(
+        &mut self,
+        cfg: &crate::config::InboxConfig,
+        llm: &LlmConfig,
+        format: &dyn ModelFormat,
+        status: &Arc<Mutex<ServeStatus>>,
+    ) -> Option<Duration> {
+        if !INBOX_CHANGED.swap(false, Ordering::Relaxed) && self.watch.pending_count == 0 {
+            return None;
+        }
+        let pending = crate::inbox::scan_pending(&self.root, cfg);
+        let now = Instant::now();
+        if pending.len() != self.watch.pending_count {
+            self.watch.pending_count = pending.len();
+            self.watch.last_change = Some(now);
+            if pending.is_empty() {
+                self.watch.first_seen = None;
+            } else if self.watch.first_seen.is_none() {
+                self.watch.first_seen = Some(now);
+            }
+        }
+        if pending.is_empty() {
+            return None;
+        }
+        let settled = self.watch.last_change
+            .map(|t| now.duration_since(t) >= Duration::from_millis(cfg.settle_ms))
+            .unwrap_or(false);
+        let capped = self.watch.first_seen
+            .map(|t| now.duration_since(t) >= Duration::from_millis(cfg.max_settle_ms))
+            .unwrap_or(false);
+        if !(settled || capped) {
+            return Some(Duration::from_millis(cfg.settle_ms));
+        }
+
+        // Sweep one batch, split by provenance into separate turns.
+        let claimed =
+            crate::inbox::claim_batch(&self.root, &pending, cfg, &mut self.rate, now, cfg.max_batch);
+        self.watch = InboxWatch::default();
+        INBOX_CHANGED.store(true, Ordering::Relaxed); // rescan next tick for leftovers/overflow
+        if claimed.is_empty() {
+            return None;
+        }
+        let trusted: Vec<&crate::inbox::Claimed> = claimed
+            .iter()
+            .filter(|c| c.provenance == crate::inbox::Provenance::Trusted)
+            .collect();
+        let untrusted: Vec<&crate::inbox::Claimed> = claimed
+            .iter()
+            .filter(|c| c.provenance == crate::inbox::Provenance::Untrusted)
+            .collect();
+        if !trusted.is_empty() {
+            let d = crate::inbox::build_digest(&trusted, crate::inbox::Provenance::Trusted);
+            self.run(&d, true, crate::inbox::INBOX_MAX_ROUNDS, llm, format, status);
+            crate::inbox::finalize(&trusted);
+        }
+        if !untrusted.is_empty() {
+            let d = crate::inbox::build_digest(&untrusted, crate::inbox::Provenance::Untrusted);
+            self.run(&d, false, crate::inbox::UNTRUSTED_MAX_ROUNDS, llm, format, status);
+            crate::inbox::finalize(&untrusted);
+        }
+        None
+    }
+
+    /// Run ONE stateless digest turn. `msgs` is thrown away — never persisted,
+    /// never the operator's history. The reply tool is scoped to just this
+    /// digest's handles (so an untrusted turn can never reply on a trusted
+    /// party's channel).
+    fn run(
+        &self,
+        digest: &crate::inbox::Digest,
+        trusted: bool,
+        max_rounds: u64,
+        llm: &LlmConfig,
+        format: &dyn ModelFormat,
+        status: &Arc<Mutex<ServeStatus>>,
+    ) {
+        if let Ok(mut c) = self.reply_ctx.lock() {
+            c.targets = digest.targets.clone();
+            c.sent = 0;
+        }
+        let (registry, tools, system) = if trusted {
+            (&self.trusted_registry, &self.trusted_tools, &self.trusted_system)
+        } else {
+            (&self.untrusted_registry, &self.untrusted_tools, &self.untrusted_system)
+        };
+        set_busy(status, true);
+        let mut msgs = vec![Message { role: Role::System, content: system.clone() }];
+        let mut noop = |_: &str| {};
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_turn(&digest.text, &mut msgs, registry, tools, format, llm, usize::MAX, max_rounds, &mut noop)
+        }));
+        let tag = if trusted { "trusted" } else { "untrusted" };
+        match outcome {
+            Ok(t) => eprintln!("[serve/inbox:{tag}] {}", crate::tools::truncate_middle(t.trim(), 200)),
+            Err(_) => eprintln!("[serve/inbox:{tag}] turn aborted (panic)"),
+        }
+        set_busy(status, false);
+        if let Ok(mut c) = self.reply_ctx.lock() {
+            c.targets.clear();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Control socket — listener + per-connection handlers
 // ---------------------------------------------------------------------------
 
@@ -887,6 +1101,24 @@ pub fn run() {
     }
 
     // 10. The single-writer agent loop.
+    // Inbox: external event ingestion (opt-in via [inbox] enabled). Owns its own
+    // trusted + untrusted registries.
+    let mut inbox = if config.inbox.enabled {
+        match InboxRuntime::new(&config, shared_trust.clone(), vision_flag.clone(), &*format, &cwd) {
+            Some(ib) => {
+                let n = config.inbox.sources.values().filter(|s| s.enabled).count();
+                eprintln!("[serve] inbox enabled · {n} source(s)");
+                Some(ib)
+            }
+            None => {
+                eprintln!("[serve] inbox enabled but the config dir is unresolved — inbox off");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let compact_at = config.agent.compact_at;
     let heartbeat = config.agent.heartbeat;
     let mut next_hb = Instant::now() + Duration::from_secs(heartbeat.max(1));
@@ -909,7 +1141,14 @@ pub fn run() {
             next_hb = Instant::now() + Duration::from_secs(heartbeat);
         }
 
-        match serve_rx.recv_timeout(LOOP_TICK) {
+        // Inbox: rescan + maybe sweep one settled batch. Returns a short wait
+        // when events are pending-but-unsettled, so we re-check promptly.
+        let inbox_wait = inbox
+            .as_mut()
+            .and_then(|ib| ib.tick(&config.inbox, &config.llm, &*format, &status));
+        let timeout = inbox_wait.map(|w| w.min(LOOP_TICK)).unwrap_or(LOOP_TICK);
+
+        match serve_rx.recv_timeout(timeout) {
             Ok(ServeMsg::Control { content, reply }) => {
                 run_turn_streaming(
                     &content, &mut messages, &registry, &tools_json, &*format,

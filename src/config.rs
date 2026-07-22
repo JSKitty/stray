@@ -144,7 +144,67 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub inbox: InboxConfig,
 }
+
+/// The universal inbox: external sources drop event files into a directory and
+/// the headless daemon reacts. Off by default; opt in with `[inbox] enabled = true`.
+#[derive(Deserialize)]
+pub struct InboxConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Debounce: wait this long for a burst to settle before digesting.
+    #[serde(default = "default_settle_ms")]
+    pub settle_ms: u64,
+    /// Cap on the settle wait, so a non-stop stream still gets served.
+    #[serde(default = "default_max_settle_ms")]
+    pub max_settle_ms: u64,
+    /// Max events folded into one digest turn; overflow rolls to the next.
+    #[serde(default = "default_max_batch")]
+    pub max_batch: usize,
+    /// Per-source config, keyed by source name → `[inbox.sources.<name>]`.
+    #[serde(default)]
+    pub sources: std::collections::HashMap<String, SourceConfig>,
+}
+
+impl Default for InboxConfig {
+    fn default() -> Self {
+        InboxConfig {
+            enabled: false,
+            settle_ms: default_settle_ms(),
+            max_settle_ms: default_max_settle_ms(),
+            max_batch: default_max_batch(),
+            sources: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// One inbox source. A source is ONLY ingested when `enabled` (admission is an
+/// allowlist — unknown/disabled sources are ignored, never manufactured into turns).
+#[derive(Clone, Deserialize)]
+pub struct SourceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sender identities (the event's `from`) whose events are ingested
+    /// trusted-plain (and run at the agent's full config trust). Honored ONLY
+    /// when `authenticated` is true — a spoofable identity is never trusted.
+    #[serde(default)]
+    pub trusted: Vec<String>,
+    /// Is this source's `from` cryptographically unforgeable (e.g. an npub
+    /// pubkey)? Must be true for any `trusted` entry to take effect — an email
+    /// `From:` is trivially spoofable and can never grant trusted-plain.
+    #[serde(default)]
+    pub authenticated: bool,
+    /// Per-source admission cap: inbound events beyond this rate are dropped.
+    #[serde(default = "default_rate_per_min")]
+    pub rate_per_min: u32,
+}
+
+fn default_settle_ms() -> u64 { 300 }
+fn default_max_settle_ms() -> u64 { 2000 }
+fn default_max_batch() -> usize { 50 }
+fn default_rate_per_min() -> u32 { 30 }
 
 #[derive(Default, Deserialize)]
 pub struct AgentConfig {

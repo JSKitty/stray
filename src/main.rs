@@ -1,6 +1,7 @@
 mod config;
 mod tasks;
 mod event;
+mod inbox;
 #[cfg(feature = "link")]
 mod link;
 mod formats;
