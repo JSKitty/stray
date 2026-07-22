@@ -462,12 +462,17 @@ impl TaskManager {
     }
 
     /// True if the task has queued inbox messages not yet drained by its runner.
+    /// Also counts a crash-stranded `inbox.draining` (a drain that died before
+    /// removing it) so the host's re-spawn net recovers those messages too.
     pub fn has_pending_inbox(&self, name: &str) -> bool {
         if valid_task_name(name).is_err() {
             return false;
         }
-        let inbox = self.task_dir(name).join("inbox.jsonl");
-        std::fs::metadata(&inbox).map(|m| m.len() > 0).unwrap_or(false)
+        let dir = self.task_dir(name);
+        let nonempty = |p: std::path::PathBuf| {
+            std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false)
+        };
+        nonempty(dir.join("inbox.jsonl")) || nonempty(dir.join("inbox.draining"))
     }
 
     /// Record that we nudged the agent to reap this task. Persisted so the
@@ -1131,23 +1136,39 @@ fn save_history(path: &PathBuf, messages: &[crate::Message]) {
 /// Renames the inbox aside first so a concurrent send — which re-creates
 /// inbox.jsonl — isn't lost during the drain. Returns how many were drained.
 ///
+/// Crash recovery: a prior drain that died between the rename and the remove
+/// leaves messages stranded in inbox.draining. We re-ingest that leftover first
+/// (it's older than the current inbox.jsonl, and — since remove happens before
+/// any processing — was never handled), so a mid-drain crash never orphans mail.
+///
 /// Residual race (accepted): a sender that has already opened its append fd at
 /// the instant of the rename writes into the renamed file, which may be read or
 /// deleted before that write lands. The window is microseconds at human message
 /// pace; a lost message can always be re-sent. If this ever matters, switch to
 /// per-message files (maildir-style) or an flock.
 fn drain_inbox(dir: &std::path::Path, messages: &mut Vec<crate::Message>) -> usize {
-    use crate::{Message, Role as MsgRole};
     let inbox = dir.join("inbox.jsonl");
-    if !inbox.exists() {
-        return 0;
-    }
     let staged = dir.join("inbox.draining");
-    if std::fs::rename(&inbox, &staged).is_err() {
-        return 0;
+    let mut n = 0;
+    // Recover a leftover from a crashed prior drain, oldest-first.
+    if staged.exists() {
+        n += ingest_staged(&staged, messages);
     }
-    let content = std::fs::read_to_string(&staged).unwrap_or_default();
-    let _ = std::fs::remove_file(&staged);
+    // Normal path: atomically move the live inbox aside, then ingest it.
+    if inbox.exists() && std::fs::rename(&inbox, &staged).is_ok() {
+        n += ingest_staged(&staged, messages);
+    }
+    if n > 0 {
+        eprintln!("[task] drained {n} queued message(s) from inbox");
+    }
+    n
+}
+
+/// Read every JSON line of `staged` into `messages`, then delete it.
+fn ingest_staged(staged: &std::path::Path, messages: &mut Vec<crate::Message>) -> usize {
+    use crate::{Message, Role as MsgRole};
+    let content = std::fs::read_to_string(staged).unwrap_or_default();
+    let _ = std::fs::remove_file(staged);
     let mut n = 0;
     for line in content.lines() {
         let line = line.trim();
@@ -1160,9 +1181,6 @@ fn drain_inbox(dir: &std::path::Path, messages: &mut Vec<crate::Message>) -> usi
                 n += 1;
             }
         }
-    }
-    if n > 0 {
-        eprintln!("[task] drained {n} queued message(s) from inbox");
     }
     n
 }
@@ -1247,6 +1265,33 @@ model = "m"
         assert!(!inbox.exists(), "inbox must be consumed after draining");
         // Nothing left to drain.
         assert_eq!(super::drain_inbox(&dir, &mut msgs), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inbox_recovers_crash_stranded_draining() {
+        use std::io::Write;
+        // Simulate a drain that crashed after the rename but before the remove:
+        // a leftover inbox.draining sits beside a freshly-arrived inbox.jsonl.
+        let dir = std::env::temp_dir().join(format!("stray-inbox-recover-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        {
+            let mut f = std::fs::File::create(dir.join("inbox.draining")).unwrap();
+            writeln!(f, "{}", serde_json::json!({ "content": "stranded" })).unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(dir.join("inbox.jsonl")).unwrap();
+            writeln!(f, "{}", serde_json::json!({ "content": "fresh" })).unwrap();
+        }
+
+        let mut msgs: Vec<crate::Message> = Vec::new();
+        assert_eq!(super::drain_inbox(&dir, &mut msgs), 2);
+        // Recovered leftover comes first (it's older than the live inbox).
+        assert_eq!(msgs[0].content, "stranded");
+        assert_eq!(msgs[1].content, "fresh");
+        assert!(!dir.join("inbox.jsonl").exists());
+        assert!(!dir.join("inbox.draining").exists(), "staged file must be removed");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

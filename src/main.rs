@@ -835,6 +835,9 @@ fn poll_task_completions(state: &mut AppState) -> Vec<String> {
     use std::sync::Mutex;
     static TASK_PREV: Mutex<Option<std::collections::HashMap<String, tasks::TaskStatus>>> = Mutex::new(None);
     static TASK_NOTIFIED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    // Tasks whose stranded-inbox re-spawn is currently failing — tracked so the
+    // failure is surfaced once, not re-logged every poll tick.
+    static TASK_RESPAWN_FAILED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
     // Reap-prod throttling ("at most weekly") is persisted per-task in task.toml
     // (last_prodded), so it survives restarts — no in-memory map needed here.
     static LAST_IDLE_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -859,6 +862,8 @@ fn poll_task_completions(state: &mut AppState) -> Vec<String> {
     let prev_map = prev_guard.get_or_insert_with(std::collections::HashMap::new);
     let mut notified_guard = TASK_NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
     let notified = notified_guard.get_or_insert_with(std::collections::HashSet::new);
+    let mut respawn_failed_guard = TASK_RESPAWN_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    let respawn_failed = respawn_failed_guard.get_or_insert_with(std::collections::HashSet::new);
 
     let mut notifications = Vec::new();
     let mut current_names = std::collections::HashSet::new();
@@ -894,7 +899,16 @@ fn poll_task_completions(state: &mut AppState) -> Vec<String> {
                 && !mgr.is_alive(task.pid)
                 && mgr.has_pending_inbox(&task.name)
             {
-                let _ = mgr.spawn(&task.name);
+                match mgr.spawn(&task.name) {
+                    Ok(_) => { respawn_failed.remove(&task.name); }
+                    // Surface a persistently-failing re-spawn once, not every tick.
+                    Err(e) => {
+                        if respawn_failed.insert(task.name.clone()) {
+                            state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                content: format!("Task {BOLD}{}{RESET} has queued messages but couldn't be re-spawned: {e}", task.name) });
+                        }
+                    }
+                }
             }
 
             // Completion transition
