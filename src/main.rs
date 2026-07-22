@@ -212,6 +212,7 @@ pub(crate) fn call_llm(
                                 } else {
                                     peers.push(link::PeerEntry {
                                         name, endpoint_id, trusted: true, last_seen: 0, addr: addr_str,
+                                        trust: String::new(),
                                     });
                                 }
                                 link::save_peers(&peers);
@@ -1772,6 +1773,13 @@ fn main() {
                 std::process::exit(serve::send_cli(&msg));
             }
             Some("status") => { std::process::exit(serve::status_cli()); }
+            #[cfg(feature = "link")]
+            Some("peers") => { std::process::exit(serve::peers_cli()); }
+            #[cfg(feature = "link")]
+            Some("peer-trust") => {
+                let rest = if args.len() >= 3 { args[2..].join(" ") } else { String::new() };
+                std::process::exit(serve::peer_trust_cli(&rest));
+            }
             _ => {}
         }
     }
@@ -2420,6 +2428,7 @@ fn main() {
                             } else {
                                 peers.push(link::PeerEntry {
                                     name, endpoint_id, trusted: true, last_seen: 0, addr: addr_str,
+                                    trust: String::new(),
                                 });
                             }
                             link::save_peers(&peers);

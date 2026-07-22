@@ -55,6 +55,20 @@ impl TrustLevel {
         }
     }
 
+    /// STRICT parse for an authoritative STORED value (e.g. a peer's granted
+    /// trust in peers.toml). Only the exact canonical `as_str()` forms — NO
+    /// lenient aliases — so a hand-edited or malformed `"off"`/`"free"` can never
+    /// silently resolve to free-roam (remote root). Unknown → None (unauthorized).
+    pub fn parse_canonical(s: &str) -> Option<Self> {
+        match s {
+            "sandboxed" => Some(TrustLevel::Sandboxed),
+            "workspace" => Some(TrustLevel::Workspace),
+            "admin" => Some(TrustLevel::Admin),
+            "free-roam" => Some(TrustLevel::FreeRoam),
+            _ => None,
+        }
+    }
+
     pub const ALL: [TrustLevel; 4] = [
         TrustLevel::Sandboxed,
         TrustLevel::Workspace,

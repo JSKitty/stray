@@ -78,6 +78,26 @@ pub struct PeerEntry {
     /// Serialized EndpointAddr JSON for reconnection (includes relay + direct addrs)
     #[serde(default)]
     pub addr: String,
+    /// TrustLevel this peer's INBOUND Link turns run at (headless `serve`), as a
+    /// string. Empty or unparseable = NOT authorized to run any turn — the safe
+    /// default. Only a deliberate local `stray peer-trust` grants execution;
+    /// pairing must NEVER set this to a runnable level.
+    #[serde(default)]
+    pub trust: String,
+}
+
+/// Sanitize an attacker-supplied peer name before persisting or displaying it.
+/// `from_name` is a plain field the remote sender chooses, and peers.toml may be
+/// read by a full-trust agent — so strip control chars/newlines (no injected
+/// instructions, no terminal-spoofing) and cap the length.
+pub fn sanitize_peer_name(raw: &str) -> String {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "(unnamed)".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -144,9 +164,54 @@ pub fn save_peers(peers: &[PeerEntry]) {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(&path, s);
+            // Atomic: write a temp sibling then rename over the target, so a
+            // concurrent reader never observes a half-written peers.toml.
+            let tmp = path.with_extension("toml.tmp");
+            if std::fs::write(&tmp, &s).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
         }
     }
+}
+
+/// Read-modify-write the peer list under an exclusive file lock, then persist.
+/// peers.toml is the authority for whether an inbound Link turn runs (and at what
+/// trust), so concurrent writers — the daemon's pairing forwarder and a
+/// `stray peer-trust` process — must not lose each other's updates (e.g. a
+/// de-elevation clobbered by a simultaneous pairing rewrite). Returns false if
+/// the lock file couldn't be opened.
+pub fn with_peers_locked<F: FnOnce(&mut Vec<PeerEntry>)>(f: F) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Some(path) = peers_path() else {
+        return false;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let lock_path = path.with_extension("toml.lock");
+    let lock = match std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let fd = lock.as_raw_fd();
+    // Retry on EINTR so a signal (e.g. SIGTERM at the nightly halt) can't drop us
+    // through to an UNLOCKED read-modify-write of the trust authority.
+    loop {
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return false; // couldn't acquire the lock — refuse rather than race
+    }
+    let mut peers = load_peers();
+    f(&mut peers);
+    save_peers(&peers);
+    unsafe { libc::flock(fd, libc::LOCK_UN); }
+    true
 }
 
 /// Get the endpoint ID (public key) without starting the full link system.
