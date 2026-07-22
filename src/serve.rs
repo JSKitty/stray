@@ -744,7 +744,22 @@ impl InboxRuntime {
         }));
         let tag = if trusted { "trusted" } else { "untrusted" };
         match outcome {
-            Ok(t) => eprintln!("[serve/inbox:{tag}] {}", crate::tools::truncate_middle(t.trim(), 200)),
+            Ok(t) => {
+                let text = t.trim().to_string();
+                eprintln!("[serve/inbox:{tag}] {}", crate::tools::truncate_middle(&text, 200));
+                // Single-DM auto-reply: if the model answered but didn't explicitly
+                // call the reply tool, deliver its final text to the sole event's
+                // sender — the natural chat behavior for a one-message digest.
+                let sent = self.reply_ctx.lock().map(|c| c.sent).unwrap_or(0);
+                if sent == 0 && digest.targets.len() == 1 && inbox_reply_deliverable(&text) {
+                    if let Some((id, target)) = digest.targets.iter().next() {
+                        match crate::inbox::write_reply(&target.source, &target.reply_to, &text, id) {
+                            Ok(()) => eprintln!("[serve/inbox:{tag}] auto-replied to {id}"),
+                            Err(e) => eprintln!("[serve/inbox:{tag}] auto-reply failed: {e}"),
+                        }
+                    }
+                }
+            }
             Err(_) => eprintln!("[serve/inbox:{tag}] turn aborted (panic)"),
         }
         set_busy(status, false);
@@ -752,6 +767,12 @@ impl InboxRuntime {
             c.targets.clear();
         }
     }
+}
+
+/// A turn's final text is worth auto-delivering only if it's a real answer, not
+/// an internal error/status marker (which would otherwise be DM'd to the sender).
+fn inbox_reply_deliverable(text: &str) -> bool {
+    !text.is_empty() && !text.starts_with("[llm error]") && !text.starts_with("[turn ")
 }
 
 // ---------------------------------------------------------------------------
