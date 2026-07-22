@@ -247,6 +247,33 @@ pub fn load() -> LoadedConfig {
     run_setup_wizard()
 }
 
+/// Non-interactive config resolution for headless modes (`stray serve`):
+/// ./stray.toml → global config. Never runs the setup wizard and never treats
+/// argv as a path (the daemon's argv[1] is the verb, not a config file).
+/// Returns None when no config file exists — the caller should error out rather
+/// than block a TTY-less process on the interactive wizard.
+pub fn load_existing() -> Option<LoadedConfig> {
+    if std::path::Path::new("stray.toml").exists() {
+        return Some(LoadedConfig {
+            config: load_from_file("stray.toml"),
+            source: ConfigSource::Local,
+            path: "stray.toml".into(),
+        });
+    }
+    if let Some(dir) = global_config_dir() {
+        let global_path = dir.join(CONFIG_FILENAME);
+        if global_path.exists() {
+            let path_str = global_path.to_string_lossy().to_string();
+            return Some(LoadedConfig {
+                config: load_from_file(&path_str),
+                source: ConfigSource::Global,
+                path: global_path,
+            });
+        }
+    }
+    None
+}
+
 fn load_from_file(path: &str) -> Config {
     let config_str = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("Failed to read {}: {}", path, e);

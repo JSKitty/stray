@@ -8,6 +8,7 @@ mod highlight;
 mod markdown;
 mod roles;
 mod sandbox;
+mod serve;
 mod term;
 mod tools;
 mod trust;
@@ -702,7 +703,7 @@ fn run_heartbeat(
 // Main
 // ---------------------------------------------------------------------------
 
-fn build_system_prompt(config: &Config, format: &dyn ModelFormat, registry: &ToolRegistry, cwd: &str) -> String {
+pub(crate) fn build_system_prompt(config: &Config, format: &dyn ModelFormat, registry: &ToolRegistry, cwd: &str) -> String {
     format!(
         "{}\n\nToday is {}. Timestamps in messages are local time (HH:MM). Working directory: {}{}",
         config.agent.system_prompt, date_today(), cwd, format.system_prompt_suffix(registry)
@@ -1760,6 +1761,18 @@ fn main() {
         if args.len() >= 3 && args[1] == "--task" {
             tasks::run_headless(&args[2]);
             return;
+        }
+        // Headless command-center verbs (no TUI). Parsed here so argv[1] isn't
+        // mistaken for a config path by config::load().
+        match args.get(1).map(String::as_str) {
+            Some("serve") => { serve::run(); return; }
+            Some("send") => {
+                // Message from the remaining args (joined), or stdin if absent/`-`.
+                let msg = if args.len() >= 3 { args[2..].join(" ") } else { String::new() };
+                std::process::exit(serve::send_cli(&msg));
+            }
+            Some("status") => { std::process::exit(serve::status_cli()); }
+            _ => {}
         }
     }
 
