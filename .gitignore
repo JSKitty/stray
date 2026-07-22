@@ -2,3 +2,4 @@
 Cargo.lock
 stray.toml
 *.bak
+.DS_Store

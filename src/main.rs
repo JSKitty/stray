@@ -1,5 +1,5 @@
 mod config;
-mod departments;
+mod tasks;
 mod event;
 #[cfg(feature = "link")]
 mod link;
@@ -177,9 +177,9 @@ pub(crate) fn call_llm(
                             if s.spinner.active {
                                 s.spinner.frame = (s.spinner.frame + 1) % 10;
                             }
-                            // Poll department completions — notifications go to message queue
-                            let dept_notifs = poll_department_completions(s);
-                            for n in dept_notifs {
+                            // Poll task completions — notifications go to message queue
+                            let task_notifs = poll_task_completions(s);
+                            for n in task_notifs {
                                 queued_messages.push(n);
                             }
                             s.render();
@@ -610,8 +610,8 @@ fn run_heartbeat(
                                                 state.advance_cat_anim();
                                                 state.spinner.frame = (state.spinner.frame + 1) % 10;
                                                 state.tick_fade();
-                                                let dept_notifs = poll_department_completions(state);
-                                                for n in dept_notifs {
+                                                let task_notifs = poll_task_completions(state);
+                                                for n in task_notifs {
                                                     queued_messages.push(n);
                                                 }
                                                 state.render();
@@ -797,90 +797,108 @@ fn open_config_selector(state: &mut AppState, id: &str, config: &Config) {
     }
 }
 
-/// Open the departments selector (reused by /departments command and Escape back-navigation).
-/// Poll departments for completion and return notification messages.
+/// Open the tasks selector (reused by /tasks command and Escape back-navigation).
+/// Poll tasks for completion and return notification messages.
 /// Uses static state so it can be called from any tick handler.
-/// Start a filesystem watcher on the departments directory.
-/// Sets the DEPT_CHANGED flag when any file is modified.
-fn start_department_watcher() {
+/// Start a filesystem watcher on the tasks directory.
+/// Sets the TASK_CHANGED flag when any file is modified.
+fn start_task_watcher() {
     use notify::{RecursiveMode, Watcher};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::SeqCst) { return; } // already running
 
-    if let Some(base) = config::global_config_dir() {
-        let dept_dir = base.join("departments");
-        let _ = std::fs::create_dir_all(&dept_dir);
+    // Go through TaskManager::new() so its one-time departments/->tasks/ migration
+    // runs first — otherwise creating an empty tasks/ here could pre-empt it.
+    if let Some(mgr) = tasks::TaskManager::new() {
+        let task_dir = mgr.base_dir.clone();
+        let _ = std::fs::create_dir_all(&task_dir);
         std::thread::spawn(move || {
             let mut watcher = match notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
-                DEPT_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                TASK_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
             }) {
                 Ok(w) => w,
                 Err(_) => return,
             };
-            let _ = watcher.watch(&dept_dir, RecursiveMode::Recursive);
+            let _ = watcher.watch(&task_dir, RecursiveMode::Recursive);
             // Keep thread alive — watcher is dropped if thread exits
             loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
         });
     }
 }
 
-static DEPT_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true); // true on first run to do initial scan
+static TASK_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true); // true on first run to do initial scan
 
-fn poll_department_completions(state: &mut AppState) -> Vec<String> {
+fn poll_task_completions(state: &mut AppState) -> Vec<String> {
     use std::sync::Mutex;
-    static DEPT_PREV: Mutex<Option<std::collections::HashMap<String, departments::DeptStatus>>> = Mutex::new(None);
-    static DEPT_NOTIFIED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    static TASK_PREV: Mutex<Option<std::collections::HashMap<String, tasks::TaskStatus>>> = Mutex::new(None);
+    static TASK_NOTIFIED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    // Reap-prod throttling ("at most weekly") is persisted per-task in task.toml
+    // (last_prodded), so it survives restarts — no in-memory map needed here.
+    static LAST_IDLE_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    // Only poll when the watcher signals a change
-    if !DEPT_CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // The change-watcher drives completion detection; the idle-reap scan is
+    // time-based (a task going stale writes no file), so run it at most hourly.
+    let changed = TASK_CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed);
+    let idle_due = now.saturating_sub(LAST_IDLE_SCAN.load(std::sync::atomic::Ordering::Relaxed)) >= 3600;
+    if !changed && !idle_due {
         return Vec::new();
     }
+    if idle_due {
+        LAST_IDLE_SCAN.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
 
-    let mut prev_guard = DEPT_PREV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut prev_guard = TASK_PREV.lock().unwrap_or_else(|e| e.into_inner());
     let prev_map = prev_guard.get_or_insert_with(std::collections::HashMap::new);
-    let mut notified_guard = DEPT_NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut notified_guard = TASK_NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
     let notified = notified_guard.get_or_insert_with(std::collections::HashSet::new);
 
     let mut notifications = Vec::new();
+    let mut current_names = std::collections::HashSet::new();
 
-    if let Some(mgr) = departments::DepartmentManager::new() {
-        for dept in mgr.list() {
-            let prev = prev_map.get(&dept.name).copied();
+    if let Some(mgr) = tasks::TaskManager::new() {
+        for task in mgr.list() {
+            current_names.insert(task.name.clone());
+            let prev = prev_map.get(&task.name).copied();
 
             // Zombie detection — only if we previously confirmed the process was alive
             // (prevents false positives from stale "working" status on Stray restart)
-            if dept.status == departments::DeptStatus::Working
-                && dept.pid > 0 && !mgr.is_alive(dept.pid)
-                && prev == Some(departments::DeptStatus::Working)
+            if task.status == tasks::TaskStatus::Working
+                && task.pid > 0 && !mgr.is_alive(task.pid)
+                && prev == Some(tasks::TaskStatus::Working)
             {
-                mgr.update_status(&dept.name, departments::DeptStatus::Failed, 0);
+                mgr.update_status(&task.name, tasks::TaskStatus::Failed, 0);
                 state.push_chat(ChatLine { kind: ChatLineKind::Error,
-                    content: format!("Department {BOLD}{}{RESET} failed (process died)", dept.name) });
+                    content: format!("Task {BOLD}{}{RESET} failed (process died)", task.name) });
             }
-            let current = dept.status;
-            prev_map.insert(dept.name.clone(), current);
+            let current = task.status;
+            prev_map.insert(task.name.clone(), current);
 
             // Clear notification flag if resumed
-            if current == departments::DeptStatus::Working {
-                notified.remove(&dept.name);
+            if current == tasks::TaskStatus::Working {
+                notified.remove(&task.name);
             }
 
             // Completion transition
-            if prev == Some(departments::DeptStatus::Working)
-                && (current == departments::DeptStatus::Done || current == departments::DeptStatus::Failed)
-                && !notified.contains(&dept.name)
+            if prev == Some(tasks::TaskStatus::Working)
+                && (current == tasks::TaskStatus::Done || current == tasks::TaskStatus::Failed)
+                && !notified.contains(&task.name)
             {
-                notified.insert(dept.name.clone());
-                let status_word = if current == departments::DeptStatus::Done { "finished" } else { "failed" };
-                let summary = if dept.progress.is_empty() { String::new() }
-                    else { format!(": {}", dept.progress) };
+                notified.insert(task.name.clone());
+                let status_word = if current == tasks::TaskStatus::Done { "finished" } else { "failed" };
+                let summary = if task.progress.is_empty() { String::new() }
+                    else { format!(": {}", task.progress) };
                 state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                    content: format!("[Department {BOLD}{}{RESET} {status_word}{summary}]", dept.name) });
+                    content: format!("[Task {BOLD}{}{RESET} {status_word}{summary}]", task.name) });
 
                 // Build notification for message queue
-                let output_path = mgr.dept_dir(&dept.name).join("workspace/output.md");
+                let output_path = mgr.task_dir(&task.name).join("workspace/output.md");
                 let output_preview = std::fs::read_to_string(&output_path).unwrap_or_default();
                 let output_preview = output_preview.trim();
                 let preview = if output_preview.len() > 500 {
@@ -889,17 +907,45 @@ fn poll_department_completions(state: &mut AppState) -> Vec<String> {
                     output_preview.to_string()
                 };
                 let check_hint = format!(
-                    "To view the full output, use: <department>\naction: check\nname: {}\n</department>",
-                    dept.name
+                    "To view the full output, use: <task>\naction: check\nname: {}\n</task>",
+                    task.name
                 );
                 let notification = if preview.is_empty() {
-                    format!("[Department '{}' {status_word}. No output was produced.]\n{check_hint}", dept.name)
+                    format!("[Task '{}' {status_word}. No output was produced.]\n{check_hint}", task.name)
                 } else {
-                    format!("[Department '{}' {status_word}. Output summary:]\n{preview}\n\n{check_hint}", dept.name)
+                    format!("[Task '{}' {status_word}. Output summary:]\n{preview}\n\n{check_hint}", task.name)
                 };
                 notifications.push(notification);
             }
+
+            // Idle-reap prod: a spent task (not running or paused) that has sat
+            // untouched past the threshold. Nudge the agent to review & delete it.
+            // Throttle to once a week via the persisted last_prodded. Guard
+            // last_active > 0 so a file with no/zero timestamp isn't read as
+            // "idle since 1970" and prodded on sight.
+            if idle_due
+                && task.last_active > 0
+                && task.status != tasks::TaskStatus::Working
+                && task.status != tasks::TaskStatus::Paused
+                && now.saturating_sub(task.last_active) >= tasks::IDLE_REAP_SECS
+                && now.saturating_sub(task.last_prodded) >= tasks::IDLE_REAP_SECS
+            {
+                mgr.mark_prodded(&task.name);
+                let days = now.saturating_sub(task.last_active) / 86_400;
+                state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                    content: format!("{DIM}Task {} idle {days}d — nudging for review{RESET}", task.name) });
+                notifications.push(format!(
+                    "[System] Task '{}' (role {}) has had no activity for {days} days — its results were most likely already used. Review it and delete it if it's spent:\n\
+                     <task>\naction: check\nname: {}\n</task>\n\
+                     then, if you're done with it:\n<task>\naction: delete\nname: {}\n</task>",
+                    task.name, task.role_key, task.name, task.name
+                ));
+            }
         }
+
+        // Prune bookkeeping for tasks that no longer exist.
+        prev_map.retain(|k, _| current_names.contains(k));
+        notified.retain(|k| current_names.contains(k));
     }
 
     notifications
@@ -913,13 +959,13 @@ fn show_subcommand_help(state: &mut AppState, cmd: &str) {
             show_link_help(state);
             return;
         }
-        "department" => format!(
-            "{CYAN}/department{RESET} — Create a new department\n\
-             {DIM}Usage: /department <name> [role:<key>] <task description>{RESET}"
+        "task" => format!(
+            "{CYAN}/task{RESET} — Create a new task\n\
+             {DIM}Usage: /task <name> [role:<key>] <task description>{RESET}"
         ),
-        "departments" => format!(
-            "{CYAN}/departments{RESET} — View and manage departments\n\
-             {DIM}Opens the department selector. Use arrow keys to navigate.{RESET}"
+        "tasks" => format!(
+            "{CYAN}/tasks{RESET} — View and manage tasks\n\
+             {DIM}Opens the task selector. Use arrow keys to navigate.{RESET}"
         ),
         _ => return,
     };
@@ -939,21 +985,21 @@ fn show_link_help(state: &mut AppState) {
     state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: help });
 }
 
-fn open_departments_selector(state: &mut AppState) {
-    if let Some(mgr) = departments::DepartmentManager::new() {
-        let depts = mgr.list();
-        if depts.is_empty() {
+fn open_tasks_selector(state: &mut AppState) {
+    if let Some(mgr) = tasks::TaskManager::new() {
+        let tasks = mgr.list();
+        if tasks.is_empty() {
             state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                content: format!("{DIM}No departments yet — use /department <name> <task> to create one{RESET}") });
+                content: format!("{DIM}No tasks yet — use /task <name> <task> to create one{RESET}") });
             state.input_label.clear(); state.input_hint.clear();
         } else {
-            let items: Vec<SelectorItem> = depts.iter().map(|d| {
+            let items: Vec<SelectorItem> = tasks.iter().map(|d| {
                 let status_str = match d.status {
-                    departments::DeptStatus::Working => format!("{CYAN}[working]"),
-                    departments::DeptStatus::Done => format!("{BOLD}[done]"),
-                    departments::DeptStatus::Failed => format!("{RED}[failed]"),
-                    departments::DeptStatus::Paused => format!("{YELLOW}[paused]"),
-                    departments::DeptStatus::Idle => format!("{DIM}[idle]"),
+                    tasks::TaskStatus::Working => format!("{CYAN}[working]"),
+                    tasks::TaskStatus::Done => format!("{BOLD}[done]"),
+                    tasks::TaskStatus::Failed => format!("{RED}[failed]"),
+                    tasks::TaskStatus::Paused => format!("{YELLOW}[paused]"),
+                    tasks::TaskStatus::Idle => format!("{DIM}[idle]"),
                 };
                 let progress = if d.progress.is_empty() { "—".to_string() } else { d.progress.clone() };
                 SelectorItem {
@@ -961,9 +1007,9 @@ fn open_departments_selector(state: &mut AppState) {
                     value: d.name.clone(),
                 }
             }).collect();
-            state.selector = Some(Selector::new("departments", items, 8));
-            state.input_label = "Departments".into();
-            state.input_hint = "Select a department to manage".into();
+            state.selector = Some(Selector::new("tasks", items, 8));
+            state.input_label = "Tasks".into();
+            state.input_hint = "Select a task to manage".into();
         }
     } else {
         state.push_chat(ChatLine { kind: ChatLineKind::Error,
@@ -1337,20 +1383,20 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 
 /// Handle safe slash commands during agent execution. Returns true if handled.
 /// Handle a key press during agent execution (call_llm or tool polling).
-/// Manages selector navigation (departments) and regular input/queuing.
+/// Manages selector navigation (tasks) and regular input/queuing.
 fn handle_agent_key(
     key: Key, state: &mut AppState, messages: &[Message], queued_messages: &mut Vec<String>,
 ) {
-    // Selector navigation (departments menu while Stray works)
+    // Selector navigation (tasks menu while Stray works)
     if state.selector.is_some() {
         match key {
             Key::Down => { state.selector.as_mut().unwrap().move_down(); }
             Key::Up => { state.selector.as_mut().unwrap().move_up(); }
             Key::Escape => {
                 if let Some(sel) = state.selector.take() {
-                    if sel.id.starts_with("departments") {
+                    if sel.id.starts_with("tasks") {
                         if sel.id.contains(':') {
-                            open_departments_selector(state);
+                            open_tasks_selector(state);
                         } else {
                             state.input_label.clear(); state.input_hint.clear();
                         }
@@ -1363,13 +1409,13 @@ fn handle_agent_key(
                 let sel = state.selector.take().unwrap();
                 let sel_value = sel.items[sel.selected].value.clone();
                 let sel_id = sel.id.clone();
-                if sel_id == "departments" {
-                    let (is_running, has_output) = if let Some(mgr) = departments::DepartmentManager::new() {
+                if sel_id == "tasks" {
+                    let (is_running, has_output) = if let Some(mgr) = tasks::TaskManager::new() {
                         let running = mgr.load_meta(&sel_value).map(|m|
-                            m.status == departments::DeptStatus::Working
+                            m.status == tasks::TaskStatus::Working
                             && m.pid > 0 && mgr.is_alive(m.pid)
                         ).unwrap_or(false);
-                        let dir = mgr.dept_dir(&sel_value);
+                        let dir = mgr.task_dir(&sel_value);
                         let has_out = std::fs::read_to_string(dir.join("workspace/output.md"))
                             .or_else(|_| std::fs::read_to_string(dir.join("output.md")))
                             .map(|c| !c.trim().is_empty()).unwrap_or(false);
@@ -1389,21 +1435,21 @@ fn handle_agent_key(
                     }
                     items.push(SelectorItem { label: "Delete".into(), value: "delete".into() });
                     let count = items.len();
-                    state.selector = Some(Selector::new(&format!("departments:{sel_value}"), items, count));
+                    state.selector = Some(Selector::new(&format!("tasks:{sel_value}"), items, count));
                     state.input_label = sel_value;
                     state.input_hint = "Choose an action".into();
-                } else if sel_id.starts_with("departments:") {
-                    let dept_name = sel_id.strip_prefix("departments:").unwrap_or("");
-                    if let Some(mgr) = departments::DepartmentManager::new() {
+                } else if sel_id.starts_with("tasks:") {
+                    let task_name = sel_id.strip_prefix("tasks:").unwrap_or("");
+                    if let Some(mgr) = tasks::TaskManager::new() {
                         match sel_value.as_str() {
                             "output" => {
-                                let dir = mgr.dept_dir(dept_name);
+                                let dir = mgr.task_dir(task_name);
                                 let path = dir.join("workspace/output.md");
                                 let path = if path.exists() { path } else { dir.join("output.md") };
                                 match std::fs::read_to_string(&path) {
                                     Ok(content) if !content.trim().is_empty() => {
                                         state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                            content: format!("{BOLD}{dept_name} output:{RESET}") });
+                                            content: format!("{BOLD}{task_name} output:{RESET}") });
                                         state.push_chat(ChatLine { kind: ChatLineKind::AgentText,
                                             content: content.trim().to_string() });
                                     }
@@ -1412,14 +1458,14 @@ fn handle_agent_key(
                                 }
                             }
                             "pause" => {
-                                mgr.pause(dept_name);
+                                mgr.pause(task_name);
                                 state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                    content: format!("Pause requested for {BOLD}{dept_name}{RESET}") });
+                                    content: format!("Pause requested for {BOLD}{task_name}{RESET}") });
                             }
                             "delete" => {
-                                match mgr.delete(dept_name) {
+                                match mgr.delete(task_name) {
                                     Ok(()) => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                        content: format!("Department {BOLD}{dept_name}{RESET} deleted") }),
+                                        content: format!("Task {BOLD}{task_name}{RESET} deleted") }),
                                     Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e }),
                                 }
                             }
@@ -1429,7 +1475,7 @@ fn handle_agent_key(
                             }
                         }
                     }
-                    open_departments_selector(state);
+                    open_tasks_selector(state);
                 }
             }
             _ => {}
@@ -1506,8 +1552,8 @@ fn handle_inline_slash(
                 content: format!("Context: ~{est} tokens ({} messages)", messages.len()),
             });
         }
-        "/departments" => {
-            open_departments_selector(state);
+        "/tasks" => {
+            open_tasks_selector(state);
         }
         "/exit" => {
             print!("\x1b[?1049l");
@@ -1667,8 +1713,8 @@ fn main() {
             println!("{}", link::get_endpoint_id());
             return;
         }
-        if args.len() >= 3 && args[1] == "--department" {
-            departments::run_headless(&args[2]);
+        if args.len() >= 3 && args[1] == "--task" {
+            tasks::run_headless(&args[2]);
             return;
         }
     }
@@ -1695,7 +1741,7 @@ fn main() {
 
     // Register tools (vision flag is shared so model switches update it)
     let vision_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llm.vision));
-    // Shared LLM config for DepartmentTool (snapshot at department creation time)
+    // Shared LLM config for TaskTool (snapshot at task creation time)
     let shared_llm = std::sync::Arc::new(std::sync::Mutex::new(config.llm.clone()));
 
     // Pre-create Link command channel for LinkTool (manager starts later with event_tx)
@@ -1710,7 +1756,7 @@ fn main() {
         r.add(Box::new(tools::ReadTool::new(vision_flag.clone())));
         r.add(Box::new(tools::WriteTool));
         r.add(Box::new(tools::EditTool));
-        r.add(Box::new(departments::DepartmentTool::new(shared_llm.clone())));
+        r.add(Box::new(tasks::TaskTool::new(shared_llm.clone())));
         #[cfg(feature = "link")]
         r.add(Box::new(link::LinkTool::new(
             link_cmd_tx.clone(),
@@ -1780,8 +1826,8 @@ fn main() {
     // Event channels (input thread + tick thread + resize watcher)
     let (event_tx, event_rx) = event::setup_event_channels();
 
-    // Filesystem watcher for department changes (instant notifications)
-    start_department_watcher();
+    // Filesystem watcher for task changes (instant notifications)
+    start_task_watcher();
 
     // Stray Link — P2P agent mesh (feature-gated)
     #[cfg(feature = "link")]
@@ -1804,7 +1850,7 @@ fn main() {
         state.render();
 
         let mut user_input: Option<String> = None;
-        let mut dept_notification: Option<Vec<String>> = None;
+        let mut task_notification: Option<Vec<String>> = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(config.agent.heartbeat);
 
         'prompt: loop {
@@ -1878,15 +1924,15 @@ fn main() {
                                         )});
                                     }
                                     state.input_label.clear(); state.input_hint.clear();
-                                } else if sel_id == "departments" {
-                                    // Selected a department — show action menu (dynamic based on status)
-                                    let dept_name = value.clone();
-                                    let (is_running, has_output) = if let Some(mgr) = departments::DepartmentManager::new() {
-                                        let running = mgr.load_meta(&dept_name).map(|m|
-                                            m.status == departments::DeptStatus::Working
+                                } else if sel_id == "tasks" {
+                                    // Selected a task — show action menu (dynamic based on status)
+                                    let task_name = value.clone();
+                                    let (is_running, has_output) = if let Some(mgr) = tasks::TaskManager::new() {
+                                        let running = mgr.load_meta(&task_name).map(|m|
+                                            m.status == tasks::TaskStatus::Working
                                             && m.pid > 0 && mgr.is_alive(m.pid)
                                         ).unwrap_or(false);
-                                        let dir = mgr.dept_dir(&dept_name);
+                                        let dir = mgr.task_dir(&task_name);
                                         let output_path = dir.join("workspace/output.md");
                                         let has_out = std::fs::read_to_string(&output_path)
                                             .or_else(|_| std::fs::read_to_string(dir.join("output.md")))
@@ -1911,31 +1957,31 @@ fn main() {
 
                                     let count = items.len();
                                     state.selector = Some(Selector::new(
-                                        &format!("departments:{dept_name}"), items, count));
-                                    state.input_label = dept_name;
+                                        &format!("tasks:{task_name}"), items, count));
+                                    state.input_label = task_name;
                                     state.input_hint = "Choose an action".into();
-                                } else if sel_id.starts_with("departments:") {
-                                    // Department action selected
-                                    let dept_name = sel_id.strip_prefix("departments:").unwrap_or("");
-                                    if let Some(mgr) = departments::DepartmentManager::new() {
+                                } else if sel_id.starts_with("tasks:") {
+                                    // Task action selected
+                                    let task_name = sel_id.strip_prefix("tasks:").unwrap_or("");
+                                    if let Some(mgr) = tasks::TaskManager::new() {
                                         match value.as_str() {
                                             "resume" | "message" => {
-                                                // Enter text input for optional message — skip departments selector
-                                                state.config_edit = Some(("dept".to_string(), dept_name.to_string()));
+                                                // Enter text input for optional message — skip tasks selector
+                                                state.config_edit = Some(("task".to_string(), task_name.to_string()));
                                                 state.input.clear();
-                                                state.input_label = format!("{dept_name} (Enter to send, ESC to cancel)");
-                                                state.input_hint = "Optional message for the department (empty = just resume)".into();
+                                                state.input_label = format!("{task_name} (Enter to send, ESC to cancel)");
+                                                state.input_hint = "Optional message for the task (empty = just resume)".into();
                                                 state.render();
                                                 continue 'prompt;
                                             }
                                             "output" => {
-                                                let dir = mgr.dept_dir(dept_name);
+                                                let dir = mgr.task_dir(task_name);
                                                 let path = dir.join("workspace/output.md");
                                                 let path = if path.exists() { path } else { dir.join("output.md") };
                                                 match std::fs::read_to_string(&path) {
                                                     Ok(content) if !content.trim().is_empty() => {
                                                         state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                                            content: format!("{BOLD}{dept_name} output:{RESET}") });
+                                                            content: format!("{BOLD}{task_name} output:{RESET}") });
                                                         // Render as AgentText for proper markdown/wrapping
                                                         state.push_chat(ChatLine { kind: ChatLineKind::AgentText,
                                                             content: content.trim().to_string() });
@@ -1945,22 +1991,22 @@ fn main() {
                                                 }
                                             }
                                             "pause" => {
-                                                mgr.pause(dept_name);
+                                                mgr.pause(task_name);
                                                 state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                                    content: format!("Pause requested for {BOLD}{dept_name}{RESET}") });
+                                                    content: format!("Pause requested for {BOLD}{task_name}{RESET}") });
                                             }
                                             "delete" => {
-                                                match mgr.delete(dept_name) {
+                                                match mgr.delete(task_name) {
                                                     Ok(()) => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                                        content: format!("Department {BOLD}{dept_name}{RESET} deleted") }),
+                                                        content: format!("Task {BOLD}{task_name}{RESET} deleted") }),
                                                     Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e }),
                                                 }
                                             }
                                             _ => {}
                                         }
                                     }
-                                    // Return to departments overview
-                                    open_departments_selector(&mut state);
+                                    // Return to tasks overview
+                                    open_tasks_selector(&mut state);
                                 } else {
                                     // Config menu routing (nested selectors)
                                     let parts: Vec<&str> = sel_id.split(':').collect();
@@ -2044,8 +2090,8 @@ fn main() {
                                 // Back-navigate: selectors with ':' in id have a parent
                                 if let Some(sel) = state.selector.take() {
                                     if let Some((parent, _)) = sel.id.rsplit_once(':') {
-                                        if parent == "departments" {
-                                            open_departments_selector(&mut state);
+                                        if parent == "tasks" {
+                                            open_tasks_selector(&mut state);
                                         } else {
                                             open_config_selector(&mut state, parent, &config);
                                         }
@@ -2198,9 +2244,9 @@ fn main() {
                         }
                         Key::Escape => {
                             if let Some((scope, _)) = state.config_edit.take() {
-                                if scope == "dept" {
-                                    // Cancel dept message, return to departments list
-                                    open_departments_selector(&mut state);
+                                if scope == "task" {
+                                    // Cancel task message, return to tasks list
+                                    open_tasks_selector(&mut state);
                                 } else {
                                     // Cancel config edit, return to options menu
                                     open_config_selector(&mut state, &format!("config:{scope}"), &config);
@@ -2248,16 +2294,16 @@ fn main() {
                     if state.tick_fade() {
                         state.render();
                     }
-                    // Department status polling (~every 2.4s)
+                    // Task status polling (~every 2.4s)
                     {
-                        let dept_notifs = poll_department_completions(&mut state);
-                        // Auto-refresh departments selector if it's currently open
+                        let task_notifs = poll_task_completions(&mut state);
+                        // Auto-refresh tasks selector if it's currently open
                         if let Some(ref sel) = state.selector {
-                            if sel.id == "departments" || sel.id.starts_with("departments:") {
+                            if sel.id == "tasks" || sel.id.starts_with("tasks:") {
                                 let old_selected = sel.selected;
                                 let old_id = sel.id.clone();
-                                if old_id == "departments" {
-                                    open_departments_selector(&mut state);
+                                if old_id == "tasks" {
+                                    open_tasks_selector(&mut state);
                                     // Preserve selection position
                                     if let Some(ref mut s) = state.selector {
                                         s.selected = old_selected.min(s.items.len().saturating_sub(1));
@@ -2266,9 +2312,9 @@ fn main() {
                                 state.render();
                             }
                         }
-                        if !dept_notifs.is_empty() {
+                        if !task_notifs.is_empty() {
                             // Trigger agent — notifications hoisted to top of queued messages
-                            dept_notification = Some(dept_notifs);
+                            task_notification = Some(task_notifs);
                             state.render();
                             break 'prompt;
                         }
@@ -2292,7 +2338,7 @@ fn main() {
                                 content: format!("{CYAN}[link]{RESET} {label} from {BOLD}{from_name}{RESET}: {content}") });
                             // Trigger agent with the message
                             let notification = format!("[Link] Remote peer '{from_name}' sent: {content}");
-                            dept_notification = Some(vec![notification]);
+                            task_notification = Some(vec![notification]);
                             state.render();
                             break 'prompt;
                         }
@@ -2343,40 +2389,29 @@ fn main() {
 
         // AGENT PHASE
         if let Some(text) = user_input {
-            // Department message mode
+            // Task message mode
             if let Some((scope, field)) = state.config_edit.take() {
-                if scope == "dept" {
+                if scope == "task" {
                     state.input_label.clear(); state.input_hint.clear();
-                    let dept_name = field;
+                    let task_name = field;
                     let message = text.trim().to_string();
-                    if let Some(mgr) = departments::DepartmentManager::new() {
+                    if let Some(mgr) = tasks::TaskManager::new() {
                         // Inject message if non-empty
                         if !message.is_empty() {
-                            let history_path = mgr.dept_dir(&dept_name).join("history.json");
-                            // Frame as follow-up task if department was completed
-                            let is_done = mgr.load_meta(&dept_name).map(|m|
-                                m.status == departments::DeptStatus::Done || m.status == departments::DeptStatus::Failed
+                            // Frame as follow-up task if task was completed
+                            let is_done = mgr.load_meta(&task_name).map(|m|
+                                m.status == tasks::TaskStatus::Done || m.status == tasks::TaskStatus::Failed
                             ).unwrap_or(false);
                             let msg_content = if is_done {
                                 format!("[{}] [System] You have a new follow-up task. Act on this and update ./output.md and ./progress.txt with your new results:\n{message}", timestamp())
                             } else {
                                 format!("[{}] {message}", timestamp())
                             };
-                            if let Ok(content) = std::fs::read_to_string(&history_path) {
-                                if let Ok(mut entries) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
-                                    entries.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": msg_content
-                                    }));
-                                    if let Ok(json) = serde_json::to_string_pretty(&entries) {
-                                        let _ = std::fs::write(&history_path, &json);
-                                    }
-                                }
-                            }
+                            mgr.append_history_message(&task_name, &msg_content);
                         }
                         // Check if already running
-                        let is_running = mgr.load_meta(&dept_name).map(|m|
-                            m.status == departments::DeptStatus::Working
+                        let is_running = mgr.load_meta(&task_name).map(|m|
+                            m.status == tasks::TaskStatus::Working
                             && m.pid > 0 && mgr.is_alive(m.pid)
                         ).unwrap_or(false);
 
@@ -2384,21 +2419,21 @@ fn main() {
                             let msg_preview = if message.is_empty() { String::new() }
                                 else { format!(": \"{message}\"") };
                             state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                content: format!("Message queued for {BOLD}{dept_name}{RESET}{msg_preview}") });
+                                content: format!("Message queued for {BOLD}{task_name}{RESET}{msg_preview}") });
                         } else {
-                            match mgr.spawn(&dept_name) {
+                            match mgr.spawn(&task_name) {
                                 Ok(pid) => {
                                     let msg_preview = if message.is_empty() { String::new() }
                                         else { format!(" with message") };
                                     state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                        content: format!("Department {BOLD}{dept_name}{RESET} resumed{msg_preview} (PID {pid})") });
+                                        content: format!("Task {BOLD}{task_name}{RESET} resumed{msg_preview} (PID {pid})") });
                                 }
                                 Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error, content: e }),
                             }
                         }
                     }
-                    // Return to departments overview
-                    open_departments_selector(&mut state);
+                    // Return to tasks overview
+                    open_tasks_selector(&mut state);
                     state.render();
                     continue;
                 }
@@ -2449,7 +2484,7 @@ fn main() {
                 match cmd {
                     "/help" => {
                         if !args.is_empty() {
-                            // Sub-command help: /help link, /help department, etc.
+                            // Sub-command help: /help link, /help task, etc.
                             let sub = args.trim().trim_start_matches('/');
                             show_subcommand_help(&mut state, sub);
                         } else {
@@ -2594,17 +2629,17 @@ fn main() {
                     "/roles" => {
                         open_roles_selector(&mut state);
                     }
-                    "/departments" => {
-                        open_departments_selector(&mut state);
+                    "/tasks" => {
+                        open_tasks_selector(&mut state);
                     }
-                    "/department" => {
-                        // Quick create: /department <name> [role:<key>] <task...>
+                    "/task" => {
+                        // Quick create: /task <name> [role:<key>] <task...>
                         if args.is_empty() {
                             state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                content: format!("{DIM}Usage: /department <name> [role:<key>] <task description>{RESET}") });
+                                content: format!("{DIM}Usage: /task <name> [role:<key>] <task description>{RESET}") });
                         } else {
                             let mut words = args.splitn(2, ' ');
-                            let dept_name = words.next().unwrap_or("").to_lowercase().replace(' ', "-");
+                            let task_name = words.next().unwrap_or("").to_lowercase().replace(' ', "-");
                             let rest = words.next().unwrap_or("");
 
                             // Parse optional role: prefix
@@ -2621,19 +2656,19 @@ fn main() {
                                 state.push_chat(ChatLine { kind: ChatLineKind::Error,
                                     content: "Task description required".into() });
                             } else if let Some(role) = roles::find_role(&role_key) {
-                                if let Some(mgr) = departments::DepartmentManager::new() {
+                                if let Some(mgr) = tasks::TaskManager::new() {
                                     let llm_snap = shared_llm.lock().map(|c| c.clone())
                                         .unwrap_or(config.llm.clone());
-                                    match mgr.create(&dept_name, &role, &task, &llm_snap, config.agent.compact_at) {
+                                    match mgr.create(&task_name, &role, &task, &llm_snap, config.agent.compact_at) {
                                         Ok(_) => {
-                                            match mgr.spawn(&dept_name) {
+                                            match mgr.spawn(&task_name) {
                                                 Ok(pid) => {
                                                     state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                                        content: format!("Department {BOLD}{dept_name}{RESET} created — role: {}, PID: {pid}", role.name) });
+                                                        content: format!("Task {BOLD}{task_name}{RESET} created — role: {}, PID: {pid}", role.name) });
                                                 }
                                                 Err(e) => {
                                                     state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
-                                                        content: format!("Department {BOLD}{dept_name}{RESET} created but failed to start: {e}") });
+                                                        content: format!("Task {BOLD}{task_name}{RESET} created but failed to start: {e}") });
                                                 }
                                             }
                                         }
@@ -2811,15 +2846,15 @@ fn main() {
                     compact_context(&config.llm, &mut messages, tc, &mut state, &event_rx);
                 }
             }
-        } else if let Some(notifications) = dept_notification {
-            // Department completed — notifications are merged with any queued user messages
+        } else if let Some(notifications) = task_notification {
+            // Task completed — notifications are merged with any queued user messages
             // Notifications hoisted to top, user messages after
             state.render();
 
-            // Combine: [dept notifications] + [any queued user messages from during the prompt phase]
+            // Combine: [task notifications] + [any queued user messages from during the prompt phase]
             let mut batch = notifications;
             // Note: user messages queued during prompt phase would be in user_input,
-            // but dept_notification breaks the prompt loop before user input is captured.
+            // but task_notification breaks the prompt loop before user input is captured.
             // Any messages queued during the AGENT phase will be handled by run_heartbeat's queue.
 
             let mut queued = Vec::new();

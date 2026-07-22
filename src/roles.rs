@@ -1,6 +1,6 @@
 //! Role definitions: system prompts, tool sets, and optional LLM config.
 //!
-//! Roles define what a Stray agent (main or department) can do and how it thinks.
+//! Roles define what a Stray agent (main or task) can do and how it thinks.
 //! Built-in roles are always present; custom roles are loaded from roles.toml.
 
 use crate::config::{global_config_dir, LlmConfig};
@@ -13,8 +13,8 @@ const ROLES_FILENAME: &str = "roles.toml";
 // Types
 // ---------------------------------------------------------------------------
 
-/// LLM configuration embedded in a role — makes departments fully self-contained.
-/// If absent, the current global config is snapshotted at department creation time.
+/// LLM configuration embedded in a role — makes tasks fully self-contained.
+/// If absent, the current global config is snapshotted at task creation time.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RoleLlmConfig {
     pub api_url: String,

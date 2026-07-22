@@ -1,4 +1,4 @@
-//! Platform-specific sandboxing for department subprocesses.
+//! Platform-specific sandboxing for task subprocesses.
 //!
 //! macOS: sandbox-exec with a generated Seatbelt profile
 //! Linux: unshare with mount + network + PID namespace isolation
@@ -51,7 +51,7 @@ pub fn detect() -> SandboxLevel {
 // macOS sandbox profile generation
 // ---------------------------------------------------------------------------
 
-/// Generate a macOS Seatbelt sandbox profile for a department.
+/// Generate a macOS Seatbelt sandbox profile for a task.
 ///
 /// `read_only`: if true, only allow file reads on the workspace (Code Reviewer, Researcher).
 /// The stray binary itself and system libraries are always readable.
@@ -95,7 +95,7 @@ fn generate_macos_profile(workspace: &Path, read_only: bool, stray_binary: &Path
 ; Stray binary
 (allow process-exec (literal "{binary}"))
 
-; Global config dir (department status, history, progress)
+; Global config dir (task status, history, progress)
 (allow file-write* (subpath "{config_dir}"))
 
 ; /dev/null and other device writes (tools like git redirect to /dev/null)
@@ -134,7 +134,7 @@ fn generate_macos_profile(workspace: &Path, read_only: bool, stray_binary: &Path
 pub fn wrap_command(
     workspace: &Path,
     read_only: bool,
-    dept_name: &str,
+    task_name: &str,
     stray_binary: &Path,
 ) -> Command {
     let level = detect();
@@ -142,24 +142,24 @@ pub fn wrap_command(
     if level == SandboxLevel::Full {
         #[cfg(target_os = "macos")]
         {
-            return wrap_macos(workspace, read_only, dept_name, stray_binary);
+            return wrap_macos(workspace, read_only, task_name, stray_binary);
         }
 
         #[cfg(target_os = "linux")]
         {
-            return wrap_linux(dept_name, stray_binary);
+            return wrap_linux(task_name, stray_binary);
         }
     }
 
     // Fallback: no sandbox, just run stray directly
     eprintln!("[sandbox] No OS sandboxing available — running with workspace chdir only");
     let mut cmd = Command::new(stray_binary);
-    cmd.arg("--department").arg(dept_name);
+    cmd.arg("--task").arg(task_name);
     cmd
 }
 
 #[cfg(target_os = "macos")]
-fn wrap_macos(workspace: &Path, read_only: bool, dept_name: &str, stray_binary: &Path) -> Command {
+fn wrap_macos(workspace: &Path, read_only: bool, task_name: &str, stray_binary: &Path) -> Command {
     let profile = generate_macos_profile(workspace, read_only, stray_binary);
 
     // Write profile to a temp file in the workspace (it's within the sandbox's read scope)
@@ -167,7 +167,7 @@ fn wrap_macos(workspace: &Path, read_only: bool, dept_name: &str, stray_binary: 
     if let Err(e) = std::fs::write(&profile_path, &profile) {
         eprintln!("[sandbox] Failed to write profile: {e} — running unsandboxed");
         let mut cmd = Command::new(stray_binary);
-        cmd.arg("--department").arg(dept_name);
+        cmd.arg("--task").arg(task_name);
         return cmd;
     }
 
@@ -175,13 +175,13 @@ fn wrap_macos(workspace: &Path, read_only: bool, dept_name: &str, stray_binary: 
     cmd.arg("-f")
         .arg(&profile_path)
         .arg(stray_binary)
-        .arg("--department")
-        .arg(dept_name);
+        .arg("--task")
+        .arg(task_name);
     cmd
 }
 
 #[cfg(target_os = "linux")]
-fn wrap_linux(dept_name: &str, stray_binary: &Path) -> Command {
+fn wrap_linux(task_name: &str, stray_binary: &Path) -> Command {
     // Use unshare for network + PID isolation
     // Mount namespace would require bind-mounting which needs more setup
     let mut cmd = Command::new("unshare");
@@ -190,7 +190,7 @@ fn wrap_linux(dept_name: &str, stray_binary: &Path) -> Command {
         .arg("--fork")     // required with --pid
         .arg("--")
         .arg(stray_binary)
-        .arg("--department")
-        .arg(dept_name);
+        .arg("--task")
+        .arg(task_name);
     cmd
 }
