@@ -1,0 +1,24 @@
+[package]
+name = "vector-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Stray ⇄ Vector bridge: relays Vector (Nostr NIP-17) DMs to Stray's inbox and delivers Stray's replies back. Runs beside the headless daemon; keeps the stray core Vector-free."
+
+[[bin]]
+name = "vector-bridge"
+path = "src/main.rs"
+
+# Own workspace root: keeps this crate (and its heavy Nostr dep tree) fully
+# separate from the `stray` core build — the daemon never resolves Vector-SDK.
+[workspace]
+
+[dependencies]
+# The Vector Bot Library — Nostr client, NIP-17 private DMs, relays.
+# Pinned to a rev (not branch=main) so a future `cargo update` can't break the
+# build or float nostr-sdk out of lockstep. Bump deliberately with nostr-sdk.
+vector_sdk = { git = "https://github.com/VectorPrivacy/Vector-SDK.git", rev = "2e824887fe4e064f9066740f32d39511937b8948" }
+# Exact-pinned to match vector_sdk's nostr-sdk so gift-wrap/key types unify.
+nostr-sdk = { version = "=0.42.0", features = ["nip44", "nip59"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

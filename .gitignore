@@ -1,4 +1,5 @@
 /target
+target/
 stray.toml
 *.bak
 .DS_Store
