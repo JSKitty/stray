@@ -149,6 +149,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/compact", "Force context compaction"),
     ("/copy", "Copy last response to clipboard"),
     ("/config", "Edit configuration"),
+    ("/trust", "Show or set the agent's trust level"),
     ("/roles", "Manage agent roles"),
     ("/tasks", "View task statuses"),
     ("/task", "Create a new task"),

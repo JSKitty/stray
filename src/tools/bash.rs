@@ -1,5 +1,7 @@
 use super::Tool;
+use crate::trust::TrustLevel;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: usize = 8192;
@@ -52,9 +54,39 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "ufw disable",
 ];
 
-pub struct BashTool;
+pub struct BashTool {
+    /// Current trust level (shared + runtime-mutable for the main agent).
+    trust: Arc<Mutex<TrustLevel>>,
+    /// Whether to OS-sandbox the command. True for the main agent; false inside
+    /// a task subprocess, which is already wrapped (no nested sandboxing).
+    os_wrap: bool,
+}
 
 impl BashTool {
+    pub fn new(trust: Arc<Mutex<TrustLevel>>, os_wrap: bool) -> Self {
+        Self { trust, os_wrap }
+    }
+
+    fn trust(&self) -> TrustLevel {
+        *self.trust.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Build the `bash -c <input>` command, OS-sandboxed per the current trust
+    /// level when `os_wrap` is set (raw otherwise).
+    fn build(&self, input: &str) -> Command {
+        let trust = self.trust();
+        if self.os_wrap && trust.is_boxed() {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let argv = vec!["bash".to_string(), "-c".to_string(), input.to_string()];
+            let allow_writes = trust != TrustLevel::Sandboxed;
+            crate::sandbox::wrap(trust, &cwd, &argv, allow_writes, trust.allows_network())
+        } else {
+            let mut c = Command::new("bash");
+            c.arg("-c").arg(input);
+            c
+        }
+    }
+
     fn check_blocked(input: &str) -> Option<String> {
         // Normalize: lowercase, collapse whitespace, normalize semicolons/pipes
         let normalized = input
@@ -122,9 +154,7 @@ impl Tool for BashTool {
             return reason;
         }
 
-        let mut child = match Command::new("bash")
-            .arg("-c")
-            .arg(input)
+        let mut child = match self.build(input)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -159,9 +189,7 @@ impl Tool for BashTool {
         if let Some(reason) = Self::check_blocked(input) {
             return Some(Err(reason));
         }
-        Some(Command::new("bash")
-            .arg("-c")
-            .arg(input)
+        Some(self.build(input)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

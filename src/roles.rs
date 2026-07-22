@@ -4,6 +4,7 @@
 //! Built-in roles are always present; custom roles are loaded from roles.toml.
 
 use crate::config::{global_config_dir, LlmConfig};
+use crate::trust::TrustLevel;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -43,7 +44,7 @@ impl RoleLlmConfig {
     }
 }
 
-/// A role defines the personality, tools, and model for an agent.
+/// A role defines the personality, tools, model, and trust level for an agent.
 #[derive(Clone)]
 pub struct Role {
     pub key: String,
@@ -53,6 +54,8 @@ pub struct Role {
     pub tools: Vec<String>,
     pub max_rounds: u64,
     pub llm: Option<RoleLlmConfig>,
+    /// How much system power a task running this role is granted.
+    pub trust: TrustLevel,
     pub builtin: bool,
 }
 
@@ -77,6 +80,8 @@ struct RoleEntry {
     max_rounds: u64,
     #[serde(default)]
     llm: Option<RoleLlmConfig>,
+    #[serde(default)]
+    trust: TrustLevel,
 }
 
 fn default_max_rounds() -> u64 {
@@ -94,13 +99,14 @@ fn builtin_roles() -> Vec<Role> {
         Role {
             key: "free-spirit".into(),
             name: "Free Spirit".into(),
-            description: "Open-ended agentic companion — full autonomy".into(),
+            description: "Open-ended agentic companion — writes within its workspace".into(),
             system_prompt: "You are a helpful autonomous assistant with access to tools.\n\
                 Be concise. Only run commands when needed. Think step by step."
                 .into(),
             tools: ALL_TOOLS.iter().map(|s| s.to_string()).collect(),
             max_rounds: 50,
             llm: None,
+            trust: TrustLevel::Workspace,
             builtin: true,
         },
         Role {
@@ -114,6 +120,7 @@ fn builtin_roles() -> Vec<Role> {
             tools: ALL_TOOLS.iter().map(|s| s.to_string()).collect(),
             max_rounds: 50,
             llm: None,
+            trust: TrustLevel::Workspace,
             builtin: true,
         },
         Role {
@@ -128,6 +135,7 @@ fn builtin_roles() -> Vec<Role> {
             tools: vec!["bash".into(), "read".into()],
             max_rounds: 25,
             llm: None,
+            trust: TrustLevel::Sandboxed,
             builtin: true,
         },
         Role {
@@ -142,6 +150,23 @@ fn builtin_roles() -> Vec<Role> {
             tools: vec!["bash".into(), "read".into()],
             max_rounds: 0, // unlimited — loops until done or paused
             llm: None,
+            trust: TrustLevel::Sandboxed,
+            builtin: true,
+        },
+        Role {
+            key: "caretaker".into(),
+            name: "Caretaker".into(),
+            description: "System caretaker — administers the host through named, least-privilege holes".into(),
+            system_prompt: "You are a careful system caretaker. You administer this machine \
+                through explicitly granted, least-privilege capabilities: you may run the system \
+                commands you've been given and read system health, but you are not a blanket root.\n\
+                Never take destructive action without a clear, stated need. After any change, \
+                report exactly what you did."
+                .into(),
+            tools: ALL_TOOLS.iter().map(|s| s.to_string()).collect(),
+            max_rounds: 50,
+            llm: None,
+            trust: TrustLevel::Admin,
             builtin: true,
         },
     ]
@@ -174,6 +199,7 @@ pub fn load_roles() -> Vec<Role> {
                             tools: entry.tools,
                             max_rounds: entry.max_rounds,
                             llm: entry.llm,
+                            trust: entry.trust,
                             builtin: false,
                         };
                         // Override built-in if same key, else append
@@ -219,6 +245,7 @@ pub fn save_role(role: &Role) -> Result<(), String> {
         tools: role.tools.clone(),
         max_rounds: role.max_rounds,
         llm: role.llm.clone(),
+        trust: role.trust,
     };
 
     // Update or append

@@ -1,10 +1,20 @@
 use super::Tool;
+use crate::trust::TrustLevel;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 const DELIMITER: &str = "\n----------\n";
 
-pub struct EditTool;
+pub struct EditTool {
+    trust: Arc<Mutex<TrustLevel>>,
+}
+
+impl EditTool {
+    pub fn new(trust: Arc<Mutex<TrustLevel>>) -> Self {
+        Self { trust }
+    }
+}
 
 impl Tool for EditTool {
     fn name(&self) -> &str { "edit" }
@@ -50,6 +60,16 @@ impl Tool for EditTool {
             if path_lower.contains(pattern) {
                 return format!("[BLOCKED] Editing this path is restricted: {pattern}");
             }
+        }
+
+        // Trust scope: Sandboxed is read-only; Workspace confines edits to cwd.
+        let trust = *self.trust.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        if !trust.allows_write(&resolved, &cwd) {
+            return format!(
+                "[BLOCKED] Trust is '{}' — edits are confined to the workspace. Raise it with /trust workspace (or higher) to edit here.",
+                trust.as_str()
+            );
         }
 
         if !resolved.exists() {

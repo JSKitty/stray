@@ -10,6 +10,7 @@ mod roles;
 mod sandbox;
 mod term;
 mod tools;
+mod trust;
 mod ui;
 
 use config::{Config, ConfigSource, LlmConfig};
@@ -885,6 +886,17 @@ fn poll_task_completions(state: &mut AppState) -> Vec<String> {
                 notified.remove(&task.name);
             }
 
+            // Stranded-message safety net: a not-running task with queued inbox
+            // messages (e.g. one that arrived just as it was finishing) gets
+            // re-spawned so it drains them. spawn() no-ops if it's already alive.
+            if current != tasks::TaskStatus::Working
+                && current != tasks::TaskStatus::Paused
+                && !mgr.is_alive(task.pid)
+                && mgr.has_pending_inbox(&task.name)
+            {
+                let _ = mgr.spawn(&task.name);
+            }
+
             // Completion transition
             if prev == Some(tasks::TaskStatus::Working)
                 && (current == tasks::TaskStatus::Done || current == tasks::TaskStatus::Failed)
@@ -1079,13 +1091,11 @@ fn save_config_field(scope: &str, field: &str, value: &str) -> Result<std::path:
                 t.insert("api_key".into(), toml::Value::String(value.into()));
             }
         }
-        "name" | "system_prompt" => {
-            let section = "agent";
-            let toml_key = if field == "name" { "name" } else { "system_prompt" };
-            let sec = table.entry(section)
+        "name" | "system_prompt" | "trust" => {
+            let sec = table.entry("agent")
                 .or_insert(toml::Value::Table(toml::map::Map::new()));
             if let Some(t) = sec.as_table_mut() {
-                t.insert(toml_key.into(), toml::Value::String(value.into()));
+                t.insert(field.into(), toml::Value::String(value.into()));
             }
         }
         _ => return Err(format!("Unknown field: {field}")),
@@ -1094,6 +1104,26 @@ fn save_config_field(scope: &str, field: &str, value: &str) -> Result<std::path:
     let output = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     std::fs::write(&path, &output).map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+/// Persist a trust level to `[agent].trust` in the actually-loaded config file
+/// (whatever its source — local, global, or a CLI-specified path).
+fn persist_trust(path: &std::path::Path, trust: crate::trust::TrustLevel) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: toml::Value = content.parse()
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let table = doc.as_table_mut().ok_or("Invalid TOML")?;
+    let agent = table.entry("agent").or_insert(toml::Value::Table(toml::map::Map::new()));
+    if let Some(t) = agent.as_table_mut() {
+        t.insert("trust".into(), toml::Value::String(trust.as_str().into()));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    let output = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(path, output).map_err(|e| e.to_string())
 }
 
 fn save_model_to_config(path: &std::path::Path, model: &str) -> Result<(), String> {
@@ -1743,6 +1773,8 @@ fn main() {
     let vision_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.llm.vision));
     // Shared LLM config for TaskTool (snapshot at task creation time)
     let shared_llm = std::sync::Arc::new(std::sync::Mutex::new(config.llm.clone()));
+    // Shared, runtime-mutable trust level for the main agent's tools (set via /trust).
+    let shared_trust = std::sync::Arc::new(std::sync::Mutex::new(config.agent.trust));
 
     // Pre-create Link command channel for LinkTool (manager starts later with event_tx)
     #[cfg(feature = "link")]
@@ -1751,11 +1783,10 @@ fn main() {
     let link_endpoint_id = link::get_endpoint_id();
 
     let registry = {
-        let mut r = ToolRegistry::new();
-        r.add(Box::new(tools::BashTool));
-        r.add(Box::new(tools::ReadTool::new(vision_flag.clone())));
-        r.add(Box::new(tools::WriteTool));
-        r.add(Box::new(tools::EditTool));
+        // The main agent's standard tools, trust-gated: bash is OS-sandboxed per
+        // the current trust level (os_wrap = true), write/edit are scope-checked.
+        let base = ["bash", "read", "write", "edit"].map(String::from);
+        let mut r = tools::build_registry(&base, shared_trust.clone(), true, vision_flag.clone());
         r.add(Box::new(tasks::TaskTool::new(shared_llm.clone())));
         #[cfg(feature = "link")]
         r.add(Box::new(link::LinkTool::new(
@@ -1842,6 +1873,14 @@ fn main() {
     let mut last_ctrlc: u64 = 0;
     let mut last_api_tokens: Option<usize> = None;
 
+    // Trust-posture banner: an unconfined or unenforceable boot must be visible.
+    if config.agent.trust == trust::TrustLevel::FreeRoam {
+        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+            content: format!("{YELLOW}⚠ trust: free-roam — no sandbox, full system access. Use /trust workspace to box it.{RESET}") });
+    } else if sandbox::backend() == "none" {
+        state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+            content: format!("{YELLOW}⚠ no OS sandbox backend on this host — bash runs unconfined (write/edit are still scope-checked). Trust: {}.{RESET}", config.agent.trust.as_str()) });
+    }
 
     // --- Main event loop ---
     loop {
@@ -2407,7 +2446,10 @@ fn main() {
                             } else {
                                 format!("[{}] {message}", timestamp())
                             };
-                            mgr.append_history_message(&task_name, &msg_content);
+                            if !mgr.enqueue_message(&task_name, &msg_content) {
+                                state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                    content: format!("Failed to queue message for task '{task_name}'") });
+                            }
                         }
                         // Check if already running
                         let is_running = mgr.load_meta(&task_name).map(|m|
@@ -2625,6 +2667,45 @@ fn main() {
                     }
                     "/config" => {
                         open_config_selector(&mut state, "config", &config);
+                    }
+                    "/trust" => {
+                        let arg = args.trim();
+                        if arg.is_empty() {
+                            let cur = *shared_trust.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut msg = format!("{BOLD}Trust: {}{RESET} — {}\n{DIM}sandbox backend: {}{RESET}\n",
+                                cur.as_str(), cur.describe(), sandbox::backend());
+                            for lvl in trust::TrustLevel::ALL {
+                                let marker = if lvl == cur { "▸" } else { " " };
+                                msg.push_str(&format!("  {marker} {:<10} {}\n", lvl.as_str(), lvl.describe()));
+                            }
+                            msg.push_str(&format!("{DIM}set with: /trust <level>{RESET}"));
+                            state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo, content: msg });
+                        } else {
+                            let (level_str, confirm) = match arg.split_once(char::is_whitespace) {
+                                Some((l, rest)) => (l, rest.trim() == "confirm"),
+                                None => (arg, false),
+                            };
+                            match trust::TrustLevel::parse(level_str) {
+                                Some(lvl) if lvl == trust::TrustLevel::FreeRoam && !confirm => {
+                                    state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                        content: format!("{YELLOW}⚠ free-roam removes the sandbox — full system access.{RESET}\nRe-run {BOLD}/trust free-roam confirm{RESET} to take the leash off.") });
+                                }
+                                Some(lvl) => {
+                                    if let Ok(mut t) = shared_trust.lock() { *t = lvl; }
+                                    config.agent.trust = lvl;
+                                    match persist_trust(&config_path, lvl) {
+                                        Ok(_) => state.push_chat(ChatLine { kind: ChatLineKind::SystemInfo,
+                                            content: format!("{BOLD}Trust set to {}{RESET} — {}", lvl.as_str(), lvl.describe()) }),
+                                        Err(e) => state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                            content: format!("Trust applied for this session, but couldn't persist: {e}") }),
+                                    }
+                                }
+                                None => {
+                                    state.push_chat(ChatLine { kind: ChatLineKind::Error,
+                                        content: format!("Unknown trust level '{level_str}'. Options: sandboxed, workspace, admin, free-roam.") });
+                                }
+                            }
+                        }
                     }
                     "/roles" => {
                         open_roles_selector(&mut state);

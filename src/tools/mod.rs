@@ -74,3 +74,28 @@ impl ToolRegistry {
         self.tools.iter().map(|t| t.tag()).collect()
     }
 }
+
+/// Build a registry of the standard tools from a list of names, threading the
+/// shared trust level through them. One place instead of the match that used to
+/// be duplicated between the main agent and the task runner.
+///
+/// `os_wrap` controls whether bash OS-sandboxes its commands (true for the main
+/// agent; false inside a task subprocess, which is already sandboxed).
+pub fn build_registry(
+    names: &[String],
+    trust: std::sync::Arc<std::sync::Mutex<crate::trust::TrustLevel>>,
+    os_wrap: bool,
+    vision: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    for name in names {
+        match name.as_str() {
+            "bash" => r.add(Box::new(BashTool::new(trust.clone(), os_wrap))),
+            "read" => r.add(Box::new(ReadTool::new(vision.clone()))),
+            "write" => r.add(Box::new(WriteTool::new(trust.clone()))),
+            "edit" => r.add(Box::new(EditTool::new(trust.clone()))),
+            other => eprintln!("[tools] unknown tool '{other}' — skipped"),
+        }
+    }
+    r
+}

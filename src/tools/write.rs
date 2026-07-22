@@ -1,10 +1,20 @@
 use super::Tool;
+use crate::trust::TrustLevel;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 const DELIMITER: &str = "\n----------\n";
 
-pub struct WriteTool;
+pub struct WriteTool {
+    trust: Arc<Mutex<TrustLevel>>,
+}
+
+impl WriteTool {
+    pub fn new(trust: Arc<Mutex<TrustLevel>>) -> Self {
+        Self { trust }
+    }
+}
 
 impl Tool for WriteTool {
     fn name(&self) -> &str { "write" }
@@ -57,6 +67,16 @@ impl Tool for WriteTool {
             if path_lower.contains(pattern) {
                 return format!("[BLOCKED] Writing to this path is restricted: {pattern}");
             }
+        }
+
+        // Trust scope: Sandboxed is read-only; Workspace confines writes to cwd.
+        let trust = *self.trust.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        if !trust.allows_write(&resolved, &cwd) {
+            return format!(
+                "[BLOCKED] Trust is '{}' — writes are confined to the workspace. Raise it with /trust workspace (or higher) to write here.",
+                trust.as_str()
+            );
         }
 
         // Create parent directories if needed

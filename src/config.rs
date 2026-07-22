@@ -156,6 +156,11 @@ pub struct AgentConfig {
     pub heartbeat: u64,
     #[serde(default = "default_compact_at")]
     pub compact_at: usize,
+    /// Default trust level for the main interactive agent's tools.
+    /// Missing key → Workspace (writes confined to the cwd tree, network on;
+    /// tighten to sandboxed for no writes/network, or /trust free-roam to opt out).
+    #[serde(default)]
+    pub trust: crate::trust::TrustLevel,
 }
 
 fn default_name() -> String { "Stray".into() }

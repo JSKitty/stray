@@ -368,17 +368,20 @@ impl TaskManager {
         let exe = std::env::current_exe()
             .map_err(|e| format!("Cannot find stray binary: {e}"))?;
 
-        // Determine if the role is read-only (no write/edit tools)
-        let read_only = if let Some(role) = roles::find_role(&meta.role_key) {
-            !role.tools.iter().any(|t| t == "write" || t == "edit")
-        } else {
-            false
-        };
-
-        let workspace = self.task_dir(name).join("workspace");
-
-        // Build command with sandbox wrapping (falls back gracefully)
-        let mut cmd = crate::sandbox::wrap_command(&workspace, read_only, name, &exe);
+        // The role's trust level drives the sandbox. A task writes to its own
+        // dir (output.md, progress.txt, task.toml, history, inbox) and needs the
+        // network for its own LLM calls — so writes are confined to the task dir
+        // and network is allowed; a FreeRoam role runs unconfined.
+        let trust = roles::find_role(&meta.role_key)
+            .map(|r| r.trust)
+            .unwrap_or_default();
+        let task_dir = self.task_dir(name);
+        let argv = vec![
+            exe.to_string_lossy().to_string(),
+            "--task".to_string(),
+            name.to_string(),
+        ];
+        let mut cmd = crate::sandbox::wrap(trust, &task_dir, &argv, true, true);
         // Redirect stderr to a log file (piped stderr blocks if buffer fills and parent never reads)
         let log_file = std::fs::File::create(self.task_dir(name).join("stderr.log"))
             .map_err(|e| format!("Failed to create stderr log: {e}"))?;
@@ -439,20 +442,32 @@ impl TaskManager {
         }
     }
 
-    /// Append a user message to a task's history.json (atomic tmp+rename).
-    /// Returns true on success. Shared by the `message` tool action and the UI.
-    pub fn append_history_message(&self, name: &str, content: &str) -> bool {
+    /// Queue a message for a task's headless runner via inbox.jsonl (append-only).
+    /// This is a SEPARATE channel from history.json — which the running child
+    /// rewrites every round — so a message sent to a live task survives to be
+    /// drained on its next round instead of being clobbered. Returns true on success.
+    pub fn enqueue_message(&self, name: &str, content: &str) -> bool {
         if valid_task_name(name).is_err() {
             return false;
         }
-        let history_path = self.task_dir(name).join("history.json");
-        let Ok(existing) = std::fs::read_to_string(&history_path) else { return false };
-        let Ok(mut entries) = serde_json::from_str::<Vec<serde_json::Value>>(&existing) else { return false };
-        entries.push(serde_json::json!({ "role": "user", "content": content }));
-        match serde_json::to_string_pretty(&entries) {
-            Ok(json) => atomic_write(&history_path, &json).is_ok(),
+        use std::io::Write;
+        let inbox = self.task_dir(name).join("inbox.jsonl");
+        let Ok(line) = serde_json::to_string(&serde_json::json!({ "content": content })) else {
+            return false;
+        };
+        match std::fs::OpenOptions::new().create(true).append(true).open(&inbox) {
+            Ok(mut f) => writeln!(f, "{line}").is_ok(),
             Err(_) => false,
         }
+    }
+
+    /// True if the task has queued inbox messages not yet drained by its runner.
+    pub fn has_pending_inbox(&self, name: &str) -> bool {
+        if valid_task_name(name).is_err() {
+            return false;
+        }
+        let inbox = self.task_dir(name).join("inbox.jsonl");
+        std::fs::metadata(&inbox).map(|m| m.len() > 0).unwrap_or(false)
     }
 
     /// Record that we nudged the agent to reap this task. Persisted so the
@@ -726,16 +741,19 @@ impl TaskTool {
             None => return format!("[error] Task '{name}' not found"),
         };
 
-        // Inject the message into history with clear framing so the agent acts on it
+        // Queue the message on the task's inbox (drained on its next round —
+        // survives even while the task is actively running).
         let msg_content = if meta.status == TaskStatus::Done || meta.status == TaskStatus::Failed {
             // Completed task — frame as a new follow-up task
             format!("[{}] [System] You have a new follow-up task. Act on this and update ./output.md and ./progress.txt with your new results:\n{message}", crate::timestamp())
         } else {
             format!("[{}] {message}", crate::timestamp())
         };
-        manager.append_history_message(name, &msg_content);
+        if !manager.enqueue_message(name, &msg_content) {
+            return format!("[error] Failed to queue message for task '{name}'");
+        }
 
-        // If already running, message is queued — the agent will see it on next history load
+        // If already running, the message is queued — the runner drains it next round
         let already_running = meta.status == TaskStatus::Working
             && meta.pid > 0
             && manager.is_alive(meta.pid);
@@ -841,24 +859,14 @@ pub fn run_headless(name: &str) {
         }
     };
 
-    // Build filtered tool registry (only role's tools)
+    // Build the role's tool registry. This subprocess is already OS-sandboxed
+    // (see TaskManager::spawn), so its tools run without a second, nested
+    // sandbox — os_wrap = false. The role's trust still scopes write/edit.
     let vision_flag = std::sync::Arc::new(
         std::sync::atomic::AtomicBool::new(llm_config.vision)
     );
-    let registry = {
-        let mut r = tools::ToolRegistry::new();
-        for tool_name in &role.tools {
-            let name: &str = tool_name;
-            match name {
-                "bash" => r.add(Box::new(tools::BashTool)),
-                "read" => r.add(Box::new(tools::ReadTool::new(vision_flag.clone()))),
-                "write" => r.add(Box::new(tools::WriteTool)),
-                "edit" => r.add(Box::new(tools::EditTool)),
-                _ => eprintln!("[task] Unknown tool in role: {tool_name}"),
-            }
-        }
-        r
-    };
+    let trust_handle = std::sync::Arc::new(std::sync::Mutex::new(role.trust));
+    let registry = tools::build_registry(&role.tools, trust_handle, false, vision_flag.clone());
 
     // Build format + tools JSON
     let format = formats::format_for_model(&llm_config.model, &registry);
@@ -940,6 +948,9 @@ pub fn run_headless(name: &str) {
             return;
         }
 
+        // Pick up any messages the host queued while we were working.
+        drain_inbox(&dir, &mut messages);
+
         // Call LLM (headless: no AppState, no event_rx)
         let resp = match call_llm(
             &llm_config, &messages, &tools_json, None, None, &tags, &mut Vec::new()
@@ -958,6 +969,12 @@ pub fn run_headless(name: &str) {
         messages.push(Message { role: MsgRole::Assistant, content: resp.content });
 
         if calls.is_empty() {
+            // A message may have landed during this round — pick it up and keep
+            // going rather than finishing on top of unseen work.
+            if drain_inbox(&dir, &mut messages) > 0 {
+                save_history(&history_path, &messages);
+                continue;
+            }
             // No tool calls — agent considers itself done
             // Finalisation: ensure progress + output are written
             if !has_progress(&progress_path) {
@@ -1110,6 +1127,46 @@ fn save_history(path: &PathBuf, messages: &[crate::Message]) {
     }
 }
 
+/// Move any queued inbox messages (inbox.jsonl) into the live message list.
+/// Renames the inbox aside first so a concurrent send — which re-creates
+/// inbox.jsonl — isn't lost during the drain. Returns how many were drained.
+///
+/// Residual race (accepted): a sender that has already opened its append fd at
+/// the instant of the rename writes into the renamed file, which may be read or
+/// deleted before that write lands. The window is microseconds at human message
+/// pace; a lost message can always be re-sent. If this ever matters, switch to
+/// per-message files (maildir-style) or an flock.
+fn drain_inbox(dir: &std::path::Path, messages: &mut Vec<crate::Message>) -> usize {
+    use crate::{Message, Role as MsgRole};
+    let inbox = dir.join("inbox.jsonl");
+    if !inbox.exists() {
+        return 0;
+    }
+    let staged = dir.join("inbox.draining");
+    if std::fs::rename(&inbox, &staged).is_err() {
+        return 0;
+    }
+    let content = std::fs::read_to_string(&staged).unwrap_or_default();
+    let _ = std::fs::remove_file(&staged);
+    let mut n = 0;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(c) = v.get("content").and_then(|c| c.as_str()) {
+                messages.push(Message { role: MsgRole::User, content: c.to_string() });
+                n += 1;
+            }
+        }
+    }
+    if n > 0 {
+        eprintln!("[task] drained {n} queued message(s) from inbox");
+    }
+    n
+}
+
 // ---------------------------------------------------------------------------
 // Signal handling for headless mode
 // ---------------------------------------------------------------------------
@@ -1167,5 +1224,30 @@ model = "m"
         assert_eq!(parsed.last_active, 0); // default — load_meta falls back to created_at
         assert_eq!(parsed.last_prodded, 0);
         assert_eq!(parsed.status, "done");
+    }
+
+    #[test]
+    fn inbox_drains_and_clears() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("stray-inbox-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let inbox = dir.join("inbox.jsonl");
+        {
+            let mut f = std::fs::File::create(&inbox).unwrap();
+            // Same shape enqueue_message writes.
+            writeln!(f, "{}", serde_json::json!({ "content": "first message" })).unwrap();
+            writeln!(f, "{}", serde_json::json!({ "content": "second" })).unwrap();
+        }
+
+        let mut msgs: Vec<crate::Message> = Vec::new();
+        assert_eq!(super::drain_inbox(&dir, &mut msgs), 2);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "first message");
+        assert_eq!(msgs[1].content, "second");
+        assert!(!inbox.exists(), "inbox must be consumed after draining");
+        // Nothing left to drain.
+        assert_eq!(super::drain_inbox(&dir, &mut msgs), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
