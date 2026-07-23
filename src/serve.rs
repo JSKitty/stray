@@ -695,7 +695,7 @@ impl InboxRuntime {
                 crate::inbox::INBOX_MAX_ROUNDS, &mut noop,
             )
         }));
-        self.finish("inbox", outcome, digest, status);
+        self.finish(outcome, digest, status);
         save_history(messages);
     }
 
@@ -712,7 +712,6 @@ impl InboxRuntime {
     /// reply tool, then clear the reply scope.
     fn finish(
         &self,
-        tag: &str,
         outcome: std::thread::Result<String>,
         digest: &crate::inbox::Digest,
         status: &Arc<Mutex<ServeStatus>>,
@@ -720,18 +719,18 @@ impl InboxRuntime {
         match outcome {
             Ok(t) => {
                 let text = t.trim().to_string();
-                eprintln!("[serve/inbox:{tag}] {}", crate::tools::truncate_middle(&text, 200));
+                eprintln!("[serve/inbox] {}", crate::tools::truncate_middle(&text, 200));
                 let sent = self.reply_ctx.lock().map(|c| c.sent).unwrap_or(0);
                 if sent == 0 && digest.targets.len() == 1 && inbox_reply_deliverable(&text) {
                     if let Some((id, target)) = digest.targets.iter().next() {
                         match crate::inbox::write_reply(&target.source, &target.reply_to, &text, id) {
-                            Ok(()) => eprintln!("[serve/inbox:{tag}] auto-replied to {id}"),
-                            Err(e) => eprintln!("[serve/inbox:{tag}] auto-reply failed: {e}"),
+                            Ok(()) => eprintln!("[serve/inbox] auto-replied to {id}"),
+                            Err(e) => eprintln!("[serve/inbox] auto-reply failed: {e}"),
                         }
                     }
                 }
             }
-            Err(_) => eprintln!("[serve/inbox:{tag}] turn aborted (panic)"),
+            Err(_) => eprintln!("[serve/inbox] turn aborted (panic)"),
         }
         set_busy(status, false);
         if let Ok(mut c) = self.reply_ctx.lock() {
@@ -1004,6 +1003,11 @@ pub fn run() {
         // carries several at once; a lone DM is auto-replied).
         if config.inbox.enabled {
             r.add(Box::new(crate::inbox::ReplyTool::new(inbox_reply_ctx.clone())));
+            // Proactive channel: message the operator on the agent's own
+            // initiative (heartbeat finding, finished task…), in ANY turn.
+            if let Some((src, to)) = crate::inbox::operator_contact(&config.inbox) {
+                r.add(Box::new(crate::inbox::NotifyTool::new(src, to)));
+            }
         }
         #[cfg(feature = "link")]
         r.add(Box::new(crate::link::LinkTool::new(
@@ -1036,7 +1040,15 @@ pub fn run() {
         .unwrap_or_else(|_| "unknown".into());
 
     // 4. History: resume across reboots/sleep; always refresh the system prompt.
-    let system = crate::build_system_prompt(&config, &*format, &registry, &cwd);
+    let mut system = crate::build_system_prompt(&config, &*format, &registry, &cwd);
+    if config.inbox.enabled && crate::inbox::operator_contact(&config.inbox).is_some() {
+        system.push_str(
+            "\n\nYou can reach the operator on your own initiative with the `notify` tool — you \
+             don't have to wait to be messaged. Use it to confirm work once it's actually done, \
+             report something you noticed during a check-in, or flag anything needing attention. \
+             Prefer one clear notify when a task finishes over staying silent.",
+        );
+    }
     let mut messages = load_history();
     if messages.is_empty() {
         messages.push(Message { role: Role::System, content: system });

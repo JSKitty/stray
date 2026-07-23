@@ -443,6 +443,64 @@ impl Tool for ReplyTool {
     }
 }
 
+/// The operator to reach proactively via `notify`: the first ENABLED,
+/// AUTHENTICATED source that has a trusted identity → (source, that identity).
+/// Sorted by source name so it's deterministic when several are configured.
+pub fn operator_contact(cfg: &crate::config::InboxConfig) -> Option<(String, String)> {
+    let mut names: Vec<&String> = cfg.sources.keys().collect();
+    names.sort();
+    for name in names {
+        let s = &cfg.sources[name];
+        if s.enabled && s.authenticated {
+            if let Some(npub) = s.trusted.first() {
+                return Some((name.clone(), npub.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Lets the agent message the operator on its OWN initiative — not a reply to an
+/// inbox event. Delivers through the same outbox a bridge already watches, so a
+/// heartbeat finding or a finished task can reach the operator unprompted.
+pub struct NotifyTool {
+    source: String,
+    to: String,
+}
+
+impl NotifyTool {
+    pub fn new(source: String, to: String) -> Self {
+        NotifyTool { source, to }
+    }
+}
+
+impl Tool for NotifyTool {
+    fn name(&self) -> &str {
+        "notify"
+    }
+    fn description(&self) -> &str {
+        "Message the operator on your OWN initiative (NOT a reply). Use it to report something \
+         you found during a check-in, confirm work you finished, or flag anything that needs \
+         their attention. The entire input is the message text."
+    }
+    fn tag(&self) -> &str {
+        "notify"
+    }
+    fn usage_hint(&self) -> &str {
+        "Heads up — the log-cleanup task is done: freed 2.3G, disk now at 24%."
+    }
+    fn execute(&self, input: &str) -> String {
+        let msg = input.trim();
+        if msg.is_empty() {
+            return "[notify error] empty message".into();
+        }
+        match write_reply(&self.source, &self.to, msg, "notify") {
+            Ok(()) => "[notified the operator]".into(),
+            Err(e) => format!("[notify error] {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
