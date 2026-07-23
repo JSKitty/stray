@@ -583,41 +583,18 @@ struct InboxWatch {
 /// config trust) and the untrusted one (REPLY-ONLY — no system access at all).
 struct InboxRuntime {
     root: std::path::PathBuf,
-    untrusted_registry: ToolRegistry,
-    untrusted_tools: Option<serde_json::Value>,
-    untrusted_system: String,
     reply_ctx: Arc<Mutex<crate::inbox::ReplyContext>>,
     rate: crate::inbox::RateLimiter,
     watch: InboxWatch,
 }
 
 impl InboxRuntime {
-    fn new(
-        config: &crate::config::Config,
-        reply_ctx: Arc<Mutex<crate::inbox::ReplyContext>>,
-        vision: Arc<AtomicBool>,
-        format: &dyn ModelFormat,
-        cwd: &str,
-    ) -> Option<Self> {
+    fn new(config: &crate::config::Config, reply_ctx: Arc<Mutex<crate::inbox::ReplyContext>>) -> Option<Self> {
         let root = crate::inbox::inbox_root()?;
 
-        // Trusted input is NOT handled here — it flows into the daemon's ONE
-        // persistent agent (same context the heartbeat and `stray send` use),
-        // with the operator's own registry. Stray is one mind, many doors.
-        //
-        // Untrusted digests DO get their own sealed context: REPLY-ONLY, no
-        // system tools at all, and thrown away afterwards — so a stranger can
-        // reason and reply but can neither touch the machine nor leave anything
-        // behind in the persistent context that a later FreeRoam turn would read.
-        let mut untrusted_registry = {
-            let sealed = Arc::new(Mutex::new(crate::trust::TrustLevel::Sandboxed));
-            crate::tools::build_registry(&[], sealed, true, vision)
-        };
-        untrusted_registry.add(Box::new(crate::inbox::ReplyTool::new(reply_ctx.clone())));
-
-        let untrusted_tools = format.format_tools(&untrusted_registry);
-        let untrusted_system = crate::build_system_prompt(config, format, &untrusted_registry, cwd);
-
+        // No registries or contexts of its own: every source feeds THE one
+        // persistent agent, using the operator's registry and conversation.
+        // Provenance is carried as a label inside the digest, not as isolation.
         for (name, s) in &config.inbox.sources {
             if s.enabled {
                 let _ = std::fs::create_dir_all(root.join(name).join("new"));
@@ -628,9 +605,6 @@ impl InboxRuntime {
 
         Some(InboxRuntime {
             root,
-            untrusted_registry,
-            untrusted_tools,
-            untrusted_system,
             reply_ctx,
             rate: crate::inbox::RateLimiter::default(),
             watch: InboxWatch::default(),
@@ -687,28 +661,14 @@ impl InboxRuntime {
         if claimed.is_empty() {
             return None;
         }
-        let trusted: Vec<&crate::inbox::Claimed> = claimed
-            .iter()
-            .filter(|c| c.provenance == crate::inbox::Provenance::Trusted)
-            .collect();
-        let untrusted: Vec<&crate::inbox::Claimed> = claimed
-            .iter()
-            .filter(|c| c.provenance == crate::inbox::Provenance::Untrusted)
-            .collect();
-        if !trusted.is_empty() {
-            // Trusted input joins THE persistent agent — same conversation the
-            // heartbeat and `stray send` use, saved and compacted like any turn.
-            let d = crate::inbox::build_digest(&trusted, crate::inbox::Provenance::Trusted);
-            self.run_persistent(&d, op_registry, op_tools, messages, compact_at, llm, format, status);
-            crate::inbox::finalize(&trusted);
-        }
-        if !untrusted.is_empty() {
-            // Untrusted input runs sealed: reply-only tools, throwaway context,
-            // never enters the persistent mind.
-            let d = crate::inbox::build_digest(&untrusted, crate::inbox::Provenance::Untrusted);
-            self.run_sealed(&d, llm, format, status);
-            crate::inbox::finalize(&untrusted);
-        }
+        // Every source feeds THE one persistent agent — same conversation the
+        // heartbeat and `stray send` use. Provenance only changes how each item is
+        // labeled inside the digest (⚠ UNVERIFIED rides inline with the content,
+        // so the framing survives into the persisted history).
+        let items: Vec<&crate::inbox::Claimed> = claimed.iter().collect();
+        let d = crate::inbox::build_digest(&items);
+        self.run_persistent(&d, op_registry, op_tools, messages, compact_at, llm, format, status);
+        crate::inbox::finalize(&items);
         None
     }
 
@@ -735,31 +695,8 @@ impl InboxRuntime {
                 crate::inbox::INBOX_MAX_ROUNDS, &mut noop,
             )
         }));
-        self.finish("trusted", outcome, digest, status);
+        self.finish("inbox", outcome, digest, status);
         save_history(messages);
-    }
-
-    /// UNTRUSTED input → a sealed, throwaway context with a REPLY-ONLY toolset.
-    /// Nothing a stranger says can touch the machine or survive the turn, so it
-    /// can never be re-read by a later FreeRoam turn.
-    fn run_sealed(
-        &self,
-        digest: &crate::inbox::Digest,
-        llm: &LlmConfig,
-        format: &dyn ModelFormat,
-        status: &Arc<Mutex<ServeStatus>>,
-    ) {
-        self.begin(digest, status);
-        let mut msgs = vec![Message { role: Role::System, content: self.untrusted_system.clone() }];
-        let mut noop = |_: &str| {};
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_turn(
-                &digest.text, &mut msgs, &self.untrusted_registry, &self.untrusted_tools,
-                format, llm, usize::MAX, crate::inbox::UNTRUSTED_MAX_ROUNDS, &mut noop,
-            )
-        }));
-        // `msgs` drops here — never persisted, never the operator's history.
-        self.finish("untrusted", outcome, digest, status);
     }
 
     /// Scope the reply tool to just this digest's handles and mark busy.
@@ -1167,7 +1104,7 @@ pub fn run() {
     // Inbox: external event ingestion (opt-in via [inbox] enabled). Owns its own
     // trusted + untrusted registries.
     let mut inbox = if config.inbox.enabled {
-        match InboxRuntime::new(&config, inbox_reply_ctx.clone(), vision_flag.clone(), &*format, &cwd) {
+        match InboxRuntime::new(&config, inbox_reply_ctx.clone()) {
             Some(ib) => {
                 let n = config.inbox.sources.values().filter(|s| s.enabled).count();
                 eprintln!("[serve] inbox enabled · {n} source(s)");
