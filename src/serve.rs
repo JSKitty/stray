@@ -583,9 +583,6 @@ struct InboxWatch {
 /// config trust) and the untrusted one (REPLY-ONLY — no system access at all).
 struct InboxRuntime {
     root: std::path::PathBuf,
-    trusted_registry: ToolRegistry,
-    trusted_tools: Option<serde_json::Value>,
-    trusted_system: String,
     untrusted_registry: ToolRegistry,
     untrusted_tools: Option<serde_json::Value>,
     untrusted_system: String,
@@ -597,33 +594,28 @@ struct InboxRuntime {
 impl InboxRuntime {
     fn new(
         config: &crate::config::Config,
-        shared_trust: Arc<Mutex<crate::trust::TrustLevel>>,
+        reply_ctx: Arc<Mutex<crate::inbox::ReplyContext>>,
         vision: Arc<AtomicBool>,
         format: &dyn ModelFormat,
         cwd: &str,
     ) -> Option<Self> {
         let root = crate::inbox::inbox_root()?;
-        let reply_ctx = Arc::new(Mutex::new(crate::inbox::ReplyContext::default()));
 
-        // Trusted digests: the agent's FULL toolset at its config trust + reply.
-        let mut trusted_registry = {
-            let base = ["bash", "read", "write", "edit"].map(String::from);
-            crate::tools::build_registry(&base, shared_trust, true, vision.clone())
-        };
-        trusted_registry.add(Box::new(crate::inbox::ReplyTool::new(reply_ctx.clone())));
-
-        // Untrusted digests: REPLY-ONLY. No system tools at all, so a hostile
-        // message can reason and reply but cannot touch the machine, read
-        // secrets, write files, or reach the network.
+        // Trusted input is NOT handled here — it flows into the daemon's ONE
+        // persistent agent (same context the heartbeat and `stray send` use),
+        // with the operator's own registry. Stray is one mind, many doors.
+        //
+        // Untrusted digests DO get their own sealed context: REPLY-ONLY, no
+        // system tools at all, and thrown away afterwards — so a stranger can
+        // reason and reply but can neither touch the machine nor leave anything
+        // behind in the persistent context that a later FreeRoam turn would read.
         let mut untrusted_registry = {
             let sealed = Arc::new(Mutex::new(crate::trust::TrustLevel::Sandboxed));
             crate::tools::build_registry(&[], sealed, true, vision)
         };
         untrusted_registry.add(Box::new(crate::inbox::ReplyTool::new(reply_ctx.clone())));
 
-        let trusted_tools = format.format_tools(&trusted_registry);
         let untrusted_tools = format.format_tools(&untrusted_registry);
-        let trusted_system = crate::build_system_prompt(config, format, &trusted_registry, cwd);
         let untrusted_system = crate::build_system_prompt(config, format, &untrusted_registry, cwd);
 
         for (name, s) in &config.inbox.sources {
@@ -636,9 +628,6 @@ impl InboxRuntime {
 
         Some(InboxRuntime {
             root,
-            trusted_registry,
-            trusted_tools,
-            trusted_system,
             untrusted_registry,
             untrusted_tools,
             untrusted_system,
@@ -651,12 +640,17 @@ impl InboxRuntime {
     /// Rescan, apply the settle/cap debounce, and sweep at most ONE batch per
     /// call (so inbox activity can't starve Control/heartbeat). Returns a short
     /// wait hint when events are pending but not yet settled.
+    #[allow(clippy::too_many_arguments)]
     fn tick(
         &mut self,
         cfg: &crate::config::InboxConfig,
         llm: &LlmConfig,
         format: &dyn ModelFormat,
         status: &Arc<Mutex<ServeStatus>>,
+        op_registry: &ToolRegistry,
+        op_tools: &Option<serde_json::Value>,
+        messages: &mut Vec<Message>,
+        compact_at: usize,
     ) -> Option<Duration> {
         if !INBOX_CHANGED.swap(false, Ordering::Relaxed) && self.watch.pending_count == 0 {
             return None;
@@ -702,54 +696,94 @@ impl InboxRuntime {
             .filter(|c| c.provenance == crate::inbox::Provenance::Untrusted)
             .collect();
         if !trusted.is_empty() {
+            // Trusted input joins THE persistent agent — same conversation the
+            // heartbeat and `stray send` use, saved and compacted like any turn.
             let d = crate::inbox::build_digest(&trusted, crate::inbox::Provenance::Trusted);
-            self.run(&d, true, crate::inbox::INBOX_MAX_ROUNDS, llm, format, status);
+            self.run_persistent(&d, op_registry, op_tools, messages, compact_at, llm, format, status);
             crate::inbox::finalize(&trusted);
         }
         if !untrusted.is_empty() {
+            // Untrusted input runs sealed: reply-only tools, throwaway context,
+            // never enters the persistent mind.
             let d = crate::inbox::build_digest(&untrusted, crate::inbox::Provenance::Untrusted);
-            self.run(&d, false, crate::inbox::UNTRUSTED_MAX_ROUNDS, llm, format, status);
+            self.run_sealed(&d, llm, format, status);
             crate::inbox::finalize(&untrusted);
         }
         None
     }
 
-    /// Run ONE stateless digest turn. `msgs` is thrown away — never persisted,
-    /// never the operator's history. The reply tool is scoped to just this
-    /// digest's handles (so an untrusted turn can never reply on a trusted
-    /// party's channel).
-    fn run(
+    /// TRUSTED input → THE persistent agent. Appends to the daemon's one
+    /// conversation with the operator's own registry, then saves + compacts it —
+    /// so a DM, an `stray send`, and a heartbeat are all one continuous mind.
+    #[allow(clippy::too_many_arguments)]
+    fn run_persistent(
         &self,
         digest: &crate::inbox::Digest,
-        trusted: bool,
-        max_rounds: u64,
+        registry: &ToolRegistry,
+        tools: &Option<serde_json::Value>,
+        messages: &mut Vec<Message>,
+        compact_at: usize,
         llm: &LlmConfig,
         format: &dyn ModelFormat,
         status: &Arc<Mutex<ServeStatus>>,
     ) {
+        self.begin(digest, status);
+        let mut noop = |_: &str| {};
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_turn(
+                &digest.text, messages, registry, tools, format, llm, compact_at,
+                crate::inbox::INBOX_MAX_ROUNDS, &mut noop,
+            )
+        }));
+        self.finish("trusted", outcome, digest, status);
+        save_history(messages);
+    }
+
+    /// UNTRUSTED input → a sealed, throwaway context with a REPLY-ONLY toolset.
+    /// Nothing a stranger says can touch the machine or survive the turn, so it
+    /// can never be re-read by a later FreeRoam turn.
+    fn run_sealed(
+        &self,
+        digest: &crate::inbox::Digest,
+        llm: &LlmConfig,
+        format: &dyn ModelFormat,
+        status: &Arc<Mutex<ServeStatus>>,
+    ) {
+        self.begin(digest, status);
+        let mut msgs = vec![Message { role: Role::System, content: self.untrusted_system.clone() }];
+        let mut noop = |_: &str| {};
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_turn(
+                &digest.text, &mut msgs, &self.untrusted_registry, &self.untrusted_tools,
+                format, llm, usize::MAX, crate::inbox::UNTRUSTED_MAX_ROUNDS, &mut noop,
+            )
+        }));
+        // `msgs` drops here — never persisted, never the operator's history.
+        self.finish("untrusted", outcome, digest, status);
+    }
+
+    /// Scope the reply tool to just this digest's handles and mark busy.
+    fn begin(&self, digest: &crate::inbox::Digest, status: &Arc<Mutex<ServeStatus>>) {
         if let Ok(mut c) = self.reply_ctx.lock() {
             c.targets = digest.targets.clone();
             c.sent = 0;
         }
-        let (registry, tools, system) = if trusted {
-            (&self.trusted_registry, &self.trusted_tools, &self.trusted_system)
-        } else {
-            (&self.untrusted_registry, &self.untrusted_tools, &self.untrusted_system)
-        };
         set_busy(status, true);
-        let mut msgs = vec![Message { role: Role::System, content: system.clone() }];
-        let mut noop = |_: &str| {};
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_turn(&digest.text, &mut msgs, registry, tools, format, llm, usize::MAX, max_rounds, &mut noop)
-        }));
-        let tag = if trusted { "trusted" } else { "untrusted" };
+    }
+
+    /// Log the turn, auto-deliver a single-DM reply if the model didn't call the
+    /// reply tool, then clear the reply scope.
+    fn finish(
+        &self,
+        tag: &str,
+        outcome: std::thread::Result<String>,
+        digest: &crate::inbox::Digest,
+        status: &Arc<Mutex<ServeStatus>>,
+    ) {
         match outcome {
             Ok(t) => {
                 let text = t.trim().to_string();
                 eprintln!("[serve/inbox:{tag}] {}", crate::tools::truncate_middle(&text, 200));
-                // Single-DM auto-reply: if the model answered but didn't explicitly
-                // call the reply tool, deliver its final text to the sole event's
-                // sender — the natural chat behavior for a one-message digest.
                 let sent = self.reply_ctx.lock().map(|c| c.sent).unwrap_or(0);
                 if sent == 0 && digest.targets.len() == 1 && inbox_reply_deliverable(&text) {
                     if let Some((id, target)) = digest.targets.iter().next() {
@@ -1022,10 +1056,18 @@ pub fn run() {
     #[cfg(not(feature = "link"))]
     let link_endpoint_id = String::from("(link disabled)");
 
+    // Reply scope shared by the one agent and the sealed untrusted context.
+    let inbox_reply_ctx = Arc::new(Mutex::new(crate::inbox::ReplyContext::default()));
+
     let registry = {
         let base = ["bash", "read", "write", "edit"].map(String::from);
         let mut r = crate::tools::build_registry(&base, shared_trust.clone(), true, vision_flag.clone());
         r.add(Box::new(crate::tasks::TaskTool::new(shared_llm.clone())));
+        // The one agent can answer inbox messages directly (needed when a sweep
+        // carries several at once; a lone DM is auto-replied).
+        if config.inbox.enabled {
+            r.add(Box::new(crate::inbox::ReplyTool::new(inbox_reply_ctx.clone())));
+        }
         #[cfg(feature = "link")]
         r.add(Box::new(crate::link::LinkTool::new(
             link_cmd_tx.clone(),
@@ -1125,7 +1167,7 @@ pub fn run() {
     // Inbox: external event ingestion (opt-in via [inbox] enabled). Owns its own
     // trusted + untrusted registries.
     let mut inbox = if config.inbox.enabled {
-        match InboxRuntime::new(&config, shared_trust.clone(), vision_flag.clone(), &*format, &cwd) {
+        match InboxRuntime::new(&config, inbox_reply_ctx.clone(), vision_flag.clone(), &*format, &cwd) {
             Some(ib) => {
                 let n = config.inbox.sources.values().filter(|s| s.enabled).count();
                 eprintln!("[serve] inbox enabled · {n} source(s)");
@@ -1164,9 +1206,12 @@ pub fn run() {
 
         // Inbox: rescan + maybe sweep one settled batch. Returns a short wait
         // when events are pending-but-unsettled, so we re-check promptly.
-        let inbox_wait = inbox
-            .as_mut()
-            .and_then(|ib| ib.tick(&config.inbox, &config.llm, &*format, &status));
+        let inbox_wait = inbox.as_mut().and_then(|ib| {
+            ib.tick(
+                &config.inbox, &config.llm, &*format, &status,
+                &registry, &tools_json, &mut messages, compact_at,
+            )
+        });
         let timeout = inbox_wait.map(|w| w.min(LOOP_TICK)).unwrap_or(LOOP_TICK);
 
         match serve_rx.recv_timeout(timeout) {
