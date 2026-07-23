@@ -672,8 +672,9 @@ impl InboxRuntime {
         None
     }
 
-    /// TRUSTED input → THE persistent agent. Appends to the daemon's one
-    /// conversation with the operator's own registry, then saves + compacts it —
+    /// Inbox input → THE persistent agent. Every event (trusted, or unverified —
+    /// provenance is a label carried inside the digest) appends to the daemon's
+    /// one conversation with the operator's registry, then saves + compacts it,
     /// so a DM, an `stray send`, and a heartbeat are all one continuous mind.
     #[allow(clippy::too_many_arguments)]
     fn run_persistent(
@@ -1006,7 +1007,8 @@ pub fn run() {
             // Proactive channel: message the operator on the agent's own
             // initiative (heartbeat finding, finished task…), in ANY turn.
             if let Some((src, to)) = crate::inbox::operator_contact(&config.inbox) {
-                r.add(Box::new(crate::inbox::NotifyTool::new(src, to)));
+                r.add(Box::new(crate::inbox::NotifyTool::new(src.clone(), to.clone())));
+                r.add(Box::new(crate::inbox::SendFileTool::new(src, to)));
             }
         }
         #[cfg(feature = "link")]
@@ -1043,10 +1045,12 @@ pub fn run() {
     let mut system = crate::build_system_prompt(&config, &*format, &registry, &cwd);
     if config.inbox.enabled && crate::inbox::operator_contact(&config.inbox).is_some() {
         system.push_str(
-            "\n\nYou can reach the operator on your own initiative with the `notify` tool — you \
-             don't have to wait to be messaged. Use it to confirm work once it's actually done, \
-             report something you noticed during a check-in, or flag anything needing attention. \
-             Prefer one clear notify when a task finishes over staying silent.",
+            "\n\nYou can reach the operator on your own initiative with the `notify` tool (a text \
+             message) or `send_file` (attach a file from disk) — you don't have to wait to be \
+             messaged. Use them to confirm work once it's actually done, hand over a file or \
+             report you produced, or flag anything needing attention. Prefer one clear notify \
+             when a task finishes over staying silent. Files the operator sends you arrive as a \
+             saved path in an inbox message — read them with your normal tools.",
         );
     }
     let mut messages = load_history();

@@ -22,13 +22,18 @@ use std::time::Duration;
 use vector_sdk::VectorBot;
 
 const MAX_CONTENT_BYTES: usize = 32 * 1024;
+const MAX_FILE_BYTES: usize = 64 * 1024 * 1024; // cap a received attachment at 64 MB
 const SEEN_CAP: usize = 4000;
 const OUTBOX_MAX_ATTEMPTS: u32 = 10;
 
 #[derive(serde::Deserialize)]
 struct OutboxReply {
     reply_to: String,
+    #[serde(default)]
     content: String,
+    /// Optional local file path to send as an attachment (Stray's send_file tool).
+    #[serde(default)]
+    file: Option<String>,
 }
 
 #[tokio::main]
@@ -62,6 +67,10 @@ async fn main() {
     {
         let recv_keys = keys.clone();
         let inbox_dir = inbox_new.clone();
+        let files_dir = data.join("inbox").join("vector").join("files");
+        cleanup_old_files(&files_dir, Duration::from_secs(7 * 24 * 3600));
+        let trusted = load_trusted(&data);
+        eprintln!("[vector-bridge] file downloads gated to {} trusted sender(s)", trusted.len());
         let mut seen = SeenSet::load(data.join("vector-bridge").join("seen.log"));
         tokio::spawn(async move {
             loop {
@@ -94,28 +103,57 @@ async fn main() {
                     Ok(u) => u,
                     Err(_) => continue, // not for us / undecryptable
                 };
-                if unwrapped.rumor.kind != Kind::PrivateDirectMessage {
-                    continue;
-                }
-                let mut content = unwrapped.rumor.content.clone();
-                if content.trim().is_empty() {
-                    continue;
-                }
-                if content.len() > MAX_CONTENT_BYTES {
-                    content.truncate(byte_boundary(&content, MAX_CONTENT_BYTES));
-                }
                 // Identity comes from the SIGNATURE-VERIFIED seal author, never
                 // the spoofable rumor.pubkey.
                 let from = match unwrapped.sender.to_bech32() {
                     Ok(n) => n,
                     Err(_) => continue,
                 };
-                match write_inbox_event(&inbox_dir, &id, &from, &content) {
-                    Ok(()) => {
-                        seen.mark(&id);
-                        eprintln!("[vector-bridge] inbound DM from {from} → inbox");
+                // kind 14 = text DM · kind 15 = file attachment (NIP-17).
+                if unwrapped.rumor.kind == Kind::PrivateDirectMessage {
+                    let mut content = unwrapped.rumor.content.clone();
+                    if content.trim().is_empty() {
+                        continue;
                     }
-                    Err(e) => eprintln!("[vector-bridge] failed to write inbox event: {e}"),
+                    if content.len() > MAX_CONTENT_BYTES {
+                        content.truncate(byte_boundary(&content, MAX_CONTENT_BYTES));
+                    }
+                    match write_inbox_event(&inbox_dir, &id, &from, &content) {
+                        Ok(()) => {
+                            seen.mark(&id);
+                            eprintln!("[vector-bridge] inbound DM from {from} → inbox");
+                        }
+                        Err(e) => eprintln!("[vector-bridge] failed to write inbox event: {e}"),
+                    }
+                } else if unwrapped.rumor.kind == Kind::from_u16(15) {
+                    // Only download files from a trusted sender. An unverified
+                    // sender's file is NOT fetched (no SSRF, no disk write of
+                    // attacker bytes) — just a neutral note that they offered one.
+                    if !trusted.iter().any(|t| t == &from) {
+                        let note = format!("[An unverified sender ({from}) offered a file over Vector. It was NOT downloaded.]");
+                        if write_inbox_event(&inbox_dir, &id, &from, &note).is_ok() {
+                            seen.mark(&id);
+                            eprintln!("[vector-bridge] refused file from untrusted {from}");
+                        }
+                        continue;
+                    }
+                    match receive_file(&unwrapped.rumor, &id, &files_dir).await {
+                        Ok((path, mime, n)) => {
+                            // Neutral, provenance-accurate — no "operator", no directive.
+                            let note = format!(
+                                "[A file arrived over Vector from {from}; decrypted and saved on disk at {} ({}, {n} bytes).]",
+                                path.display(), mime
+                            );
+                            match write_inbox_event(&inbox_dir, &id, &from, &note) {
+                                Ok(()) => {
+                                    seen.mark(&id);
+                                    eprintln!("[vector-bridge] inbound FILE from {from} → {}", path.display());
+                                }
+                                Err(e) => eprintln!("[vector-bridge] failed to write inbox event: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("[vector-bridge] file receive from {from} failed: {e}"),
+                    }
                 }
             }
         });
@@ -188,11 +226,42 @@ async fn process_outbox(bot: &VectorBot, dir: &Path, failed: &Path, attempts: &m
                 continue;
             }
         };
+        // A file whose path is gone can never succeed — drop it (don't retry forever).
+        if let Some(fp) = &reply.file {
+            if !std::path::Path::new(fp).is_file() {
+                eprintln!("[vector-bridge] outbox file '{fp}' missing — dropping");
+                let _ = std::fs::remove_file(&path);
+                attempts.remove(&name);
+                continue;
+            }
+        }
         let channel = bot.get_chat(pk).await;
-        if channel.send_private_message(&reply.content).await {
+        // Send the attachment (if any) first, then the text (if any). Both must
+        // succeed for the entry to be considered delivered.
+        let mut ok = true;
+        if let Some(fp) = &reply.file {
+            match vector_sdk::AttachmentFile::from_path(fp) {
+                Ok(af) => {
+                    if !channel.send_private_file(Some(af)).await {
+                        ok = false;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[vector-bridge] cannot read outbox file '{fp}': {e} — dropping");
+                    let _ = std::fs::remove_file(&path);
+                    attempts.remove(&name);
+                    continue;
+                }
+            }
+        }
+        if ok && !reply.content.trim().is_empty() {
+            ok = channel.send_private_message(&reply.content).await;
+        }
+        if ok {
             let _ = std::fs::remove_file(&path);
             attempts.remove(&name);
-            eprintln!("[vector-bridge] delivered reply to {}", reply.reply_to);
+            let what = if reply.file.is_some() { "file+reply" } else { "reply" };
+            eprintln!("[vector-bridge] delivered {what} to {}", reply.reply_to);
         } else {
             let n = attempts.entry(name.clone()).or_insert(0);
             *n += 1;
@@ -216,6 +285,108 @@ fn byte_boundary(s: &str, max: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+/// Read a NIP-17 file rumor (kind 15): download the encrypted blob from the URL
+/// in `content`, AES-256-GCM decrypt it with the key/nonce tags, save to
+/// `<files_dir>/<id>.<ext>`. Returns (path, mime, plaintext_len).
+async fn receive_file(
+    rumor: &UnsignedEvent,
+    id: &str,
+    files_dir: &Path,
+) -> Result<(PathBuf, String, usize), String> {
+    let url = rumor.content.trim();
+    // The url is attacker-suppliable (anyone who knows our npub can send a file),
+    // so the download is a blind-SSRF surface. Require https (no plaintext /
+    // internal http services), bound it with a timeout, and cap the size before
+    // and after fetching. The response bytes are never returned to the sender.
+    if !url.starts_with("https://") {
+        return Err("attachment url is not https — refusing".into());
+    }
+    let key = tag_value(rumor, "decryption-key").ok_or("missing decryption-key")?;
+    let nonce = tag_value(rumor, "decryption-nonce").ok_or("missing decryption-nonce")?;
+    let mime = tag_value(rumor, "file-type").unwrap_or_else(|| "application/octet-stream".into());
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(90))
+        // No redirects: an https url that 302s to http://169.254.169.254/… would
+        // otherwise defeat the https-only check and reach internal services.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().await.map_err(|e| format!("download: {e}"))?;
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_FILE_BYTES {
+            return Err(format!("attachment too large ({len} bytes)"));
+        }
+    }
+    let enc = resp.bytes().await.map_err(|e| format!("download body: {e}"))?;
+    if enc.len() > MAX_FILE_BYTES {
+        return Err(format!("attachment too large ({} bytes)", enc.len()));
+    }
+    let plain = decrypt_data(&enc, &key, &nonce)?;
+
+    std::fs::create_dir_all(files_dir).map_err(|e| e.to_string())?;
+    let path = files_dir.join(format!("{id}.{}", ext_from_mime(&mime)));
+    std::fs::write(&path, &plain).map_err(|e| e.to_string())?;
+    Ok((path, mime, plain.len()))
+}
+
+/// Mirror of vector_sdk::crypto::encrypt_data, inverted: AES-256-GCM with a
+/// 16-byte nonce, the 16-byte auth tag appended to the ciphertext.
+fn decrypt_data(enc: &[u8], key_hex: &str, nonce_hex: &str) -> Result<Vec<u8>, String> {
+    use aes::Aes256;
+    use aes_gcm::{AeadInPlace, AesGcm, KeyInit};
+    use generic_array::{typenum::U16, GenericArray};
+
+    let key = hex::decode(key_hex.trim()).map_err(|_| "bad key hex")?;
+    let nonce = hex::decode(nonce_hex.trim()).map_err(|_| "bad nonce hex")?;
+    if key.len() != 32 {
+        return Err("key must be 32 bytes".into());
+    }
+    if nonce.len() != 16 {
+        return Err("nonce must be 16 bytes".into());
+    }
+    if enc.len() < 16 {
+        return Err("ciphertext shorter than the auth tag".into());
+    }
+    let (ct, tag) = enc.split_at(enc.len() - 16);
+    let cipher = AesGcm::<Aes256, U16>::new(GenericArray::from_slice(&key));
+    let mut buf = ct.to_vec();
+    cipher
+        .decrypt_in_place_detached(GenericArray::from_slice(&nonce), &[], &mut buf, GenericArray::from_slice(tag))
+        .map_err(|_| "decryption failed (bad key/nonce/tag)".to_string())?;
+    Ok(buf)
+}
+
+/// First value of a custom rumor tag, e.g. `["decryption-key", "<hex>"]`.
+fn tag_value(rumor: &UnsignedEvent, name: &str) -> Option<String> {
+    rumor.tags.iter().find_map(|t| {
+        let s = t.as_slice();
+        (s.len() >= 2 && s[0] == name).then(|| s[1].clone())
+    })
+}
+
+/// A sensible file extension from a MIME type (common types + a subtype fallback).
+fn ext_from_mime(mime: &str) -> &'static str {
+    match mime.split(';').next().unwrap_or("").trim() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "application/x-tar" => "tar",
+        "application/json" => "json",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        "text/csv" => "csv",
+        "audio/mpeg" => "mp3",
+        "video/mp4" => "mp4",
+        _ => "bin",
+    }
 }
 
 /// Persistent, bounded set of already-ingested gift-wrap ids, so relay
@@ -248,6 +419,42 @@ impl SeenSet {
             }
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
                 let _ = writeln!(f, "{id}");
+            }
+        }
+    }
+}
+
+/// Read the trusted-sender npubs for the Vector source from Stray's config, so
+/// the bridge only ever downloads a file from a sender the operator has trusted.
+/// (A stranger's file offer becomes a text note, never a fetch + disk write —
+/// closing the SSRF / OOM / disk-fill surface at the source.)
+fn load_trusted(data: &Path) -> Vec<String> {
+    let Ok(s) = std::fs::read_to_string(data.join("stray.toml")) else {
+        return Vec::new();
+    };
+    let Ok(v) = s.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    v.get("inbox")
+        .and_then(|i| i.get("sources"))
+        .and_then(|s| s.get("vector"))
+        .and_then(|vec| vec.get("trusted"))
+        .and_then(|t| t.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// Best-effort retention: delete received files older than `max_age`.
+fn cleanup_old_files(files_dir: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(files_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if modified.elapsed().map(|e| e > max_age).unwrap_or(false) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
     }
@@ -311,4 +518,44 @@ fn load_or_generate_keys(data: &Path) -> Keys {
         Err(e) => eprintln!("[vector-bridge] WARNING: could not persist identity ({e}) — it will change on restart"),
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte-identical to vector_sdk::crypto::encrypt_data so the round-trip
+    /// proves decrypt_data reverses real SDK-encrypted attachments.
+    fn encrypt_mirror(data: &[u8], key: &[u8; 32], nonce: &[u8; 16]) -> Vec<u8> {
+        use aes::Aes256;
+        use aes_gcm::{AeadInPlace, AesGcm, KeyInit};
+        use generic_array::{typenum::U16, GenericArray};
+        let cipher = AesGcm::<Aes256, U16>::new(GenericArray::from_slice(key));
+        let mut buf = data.to_vec();
+        let tag = cipher
+            .encrypt_in_place_detached(GenericArray::from_slice(nonce), &[], &mut buf)
+            .unwrap();
+        buf.extend_from_slice(tag.as_slice());
+        buf
+    }
+
+    #[test]
+    fn aes_gcm_roundtrip_matches_sdk_scheme() {
+        let key = [7u8; 32];
+        let nonce = [3u8; 16];
+        let plain: &[u8] = b"quick brown fox \x00\xff binary too";
+        let enc = encrypt_mirror(plain, &key, &nonce);
+        let dec = decrypt_data(&enc, &hex::encode(key), &hex::encode(nonce)).unwrap();
+        assert_eq!(dec, plain);
+        // A wrong key must fail the GCM auth tag, not return garbage.
+        assert!(decrypt_data(&enc, &hex::encode([9u8; 32]), &hex::encode(nonce)).is_err());
+    }
+
+    #[test]
+    fn ext_from_mime_maps_common_types() {
+        assert_eq!(ext_from_mime("application/zip"), "zip");
+        assert_eq!(ext_from_mime("image/png"), "png");
+        assert_eq!(ext_from_mime("text/plain; charset=utf-8"), "txt");
+        assert_eq!(ext_from_mime("application/x-weird"), "bin");
+    }
 }

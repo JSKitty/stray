@@ -22,3 +22,11 @@ nostr-sdk = { version = "=0.42.0", features = ["nip44", "nip59"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
+# File attachments: download the blob + AES-256-GCM decrypt (mirrors vector_sdk's
+# encrypt scheme exactly: AesGcm<Aes256,U16>, 16-byte nonce, tag appended).
+aes = "0.8.4"
+aes-gcm = "0.10.3"
+generic-array = "0.14.7"
+hex = "0.4.3"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }

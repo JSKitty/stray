@@ -366,7 +366,7 @@ static REPLY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// never reads a partial file). Used both by the `reply` tool and by the single-DM
 /// auto-reply path in the daemon. `reply_to` is the sender handle Stray already
 /// bound to the originating event; a bridge delivers only to it.
-pub fn write_reply(source: &str, reply_to: &str, content: &str, in_reply_to: &str) -> Result<(), String> {
+fn write_outbox_json(source: &str, payload: serde_json::Value) -> Result<(), String> {
     let root = outbox_root().ok_or("cannot resolve the outbox directory")?;
     let dir = root.join(source);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -376,7 +376,6 @@ pub fn write_reply(source: &str, reply_to: &str, content: &str, in_reply_to: &st
         .unwrap_or(0);
     let seq = REPLY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stem = format!("{nanos}-{seq}");
-    let payload = serde_json::json!({ "reply_to": reply_to, "content": content, "in_reply_to": in_reply_to });
     let tmp = dir.join(format!(".tmp-{stem}"));
     let final_path = dir.join(format!("{stem}.json"));
     std::fs::write(&tmp, payload.to_string()).map_err(|e| e.to_string())?;
@@ -384,6 +383,10 @@ pub fn write_reply(source: &str, reply_to: &str, content: &str, in_reply_to: &st
         let _ = std::fs::remove_file(&tmp);
         e.to_string()
     })
+}
+
+pub fn write_reply(source: &str, reply_to: &str, content: &str, in_reply_to: &str) -> Result<(), String> {
+    write_outbox_json(source, serde_json::json!({ "reply_to": reply_to, "content": content, "in_reply_to": in_reply_to }))
 }
 
 /// Shared context set before each digest turn: which event ids this turn may
@@ -497,6 +500,63 @@ impl Tool for NotifyTool {
         match write_reply(&self.source, &self.to, msg, "notify") {
             Ok(()) => "[notified the operator]".into(),
             Err(e) => format!("[notify error] {e}"),
+        }
+    }
+}
+
+/// Queue a file (with optional caption) into `outbox/<source>/`. The bridge sends
+/// the attachment, then the caption text if present.
+pub fn write_file(source: &str, reply_to: &str, file_path: &str, caption: &str, in_reply_to: &str) -> Result<(), String> {
+    // The file and its caption are SEPARATE outbox entries, so a failed text
+    // retry never re-sends the (possibly large) attachment.
+    write_outbox_json(source, serde_json::json!({ "reply_to": reply_to, "file": file_path, "in_reply_to": in_reply_to }))?;
+    if !caption.trim().is_empty() {
+        write_outbox_json(source, serde_json::json!({ "reply_to": reply_to, "content": caption, "in_reply_to": in_reply_to }))?;
+    }
+    Ok(())
+}
+
+/// Sends a file from this machine to the operator over the bridge. Targets the
+/// same configured operator contact as `notify` — so a stranger's message can
+/// never make Stray send a file to a third party.
+pub struct SendFileTool {
+    source: String,
+    to: String,
+}
+
+impl SendFileTool {
+    pub fn new(source: String, to: String) -> Self {
+        SendFileTool { source, to }
+    }
+}
+
+impl Tool for SendFileTool {
+    fn name(&self) -> &str {
+        "send_file"
+    }
+    fn description(&self) -> &str {
+        "Send a file from this machine to the operator. First line = the path of an EXISTING \
+         file on disk; any remaining lines = an optional caption message sent alongside it."
+    }
+    fn tag(&self) -> &str {
+        "send_file"
+    }
+    fn usage_hint(&self) -> &str {
+        "/home/ai/reports/weekly.pdf\nHere's this week's report."
+    }
+    fn execute(&self, input: &str) -> String {
+        let mut parts = input.splitn(2, '\n');
+        let path = parts.next().unwrap_or("").trim();
+        let caption = parts.next().unwrap_or("").trim();
+        if path.is_empty() {
+            return "[send_file error] first line must be a file path".into();
+        }
+        if !std::path::Path::new(path).is_file() {
+            return format!("[send_file error] no such file: {path}");
+        }
+        match write_file(&self.source, &self.to, path, caption, "send_file") {
+            Ok(()) => format!("[file queued to the operator: {path}]"),
+            Err(e) => format!("[send_file error] {e}"),
         }
     }
 }
